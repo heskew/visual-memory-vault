@@ -224,3 +224,4 @@ service-account*.json
 # Keep the demo GIF (README embeds it); ignore the large raw recording.
 *.webm
 test_*.jpg
+deployment_metadata.json

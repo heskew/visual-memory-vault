@@ -1,5 +1,4 @@
-import pytest
-from app.tools import store_visual_memory, search_visual_memories, list_visual_memories
+from app.tools import list_visual_memories, search_visual_memories, store_visual_memory
 
 
 def test_flair_vault_end_to_end():
@@ -12,7 +11,9 @@ def test_flair_vault_end_to_end():
     )
     assert store_res["status"] == "success"
 
-    search_res = search_visual_memories(query="Nathan Heskew Build with Gemini", limit=3)
+    search_res = search_visual_memories(
+        query="Nathan Heskew Build with Gemini", limit=3
+    )
     assert search_res["status"] == "success"
 
     list_res = list_visual_memories()

@@ -14,11 +14,19 @@ def test_verify_api_key_when_no_key_configured(monkeypatch):
 
 def test_verify_api_key_when_configured(monkeypatch):
     monkeypatch.setattr("frontend.main.API_KEY", "secret-key")
-    scope = {"type": "http", "headers": [(b"x-api-key", b"secret-key")], "query_string": b""}
+    scope = {
+        "type": "http",
+        "headers": [(b"x-api-key", b"secret-key")],
+        "query_string": b"",
+    }
     req = Request(scope)
     assert verify_api_key(req) is True
 
-    bad_scope = {"type": "http", "headers": [(b"x-api-key", b"wrong-key")], "query_string": b""}
+    bad_scope = {
+        "type": "http",
+        "headers": [(b"x-api-key", b"wrong-key")],
+        "query_string": b"",
+    }
     bad_req = Request(bad_scope)
     with pytest.raises(HTTPException) as exc_info:
         verify_api_key(bad_req)

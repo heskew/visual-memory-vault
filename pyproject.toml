@@ -1,9 +1,11 @@
 [project]
 name = "visual-memory-vault"
 version = "0.1.0"
-description = ""
+description = "Multimodal AI visual memory vault powered by Google ADK, Gemini 3.7 Flash, and Harper FLAIR."
+readme = "README.md"
+license = { text = "Apache-2.0" }
 authors = [
-    {name = "Your Name", email = "your@email.com"},
+    {name = "Nathan Heskew", email = "nathan@harperdb.io"},
 ]
 
 dependencies = [

@@ -4,28 +4,30 @@
       "eval_case_id": "greeting",
       "prompt": {
         "role": "user",
-        "parts": [{"text": "Hello, what can you help me with?"}]
+        "parts": [{"text": "Hello, what is the Visual Memory Vault and what can you help me with?"}]
       }
     },
     {
-      "eval_case_id": "weather_query",
+      "eval_case_id": "memory_extraction_receipt",
       "prompt": {
         "role": "user",
-        "parts": [{"text": "What's the weather like in San Francisco?"}]
+        "parts": [{"text": "I took a photo of my dinner receipt at Joe's Grill on Aug 20. Total was $58.40 including tip. Please save this to my visual memory."}]
       }
     },
     {
-      "eval_case_id": "capital_lookup",
+      "eval_case_id": "memory_search_query",
       "prompt": {
         "role": "user",
-        "parts": [{"text": "What is the capital of France?"}]
-      },
-      "reference": {
-        "response": {
-          "role": "model",
-          "parts": [{"text": "The capital of France is Paris."}]
-        }
+        "parts": [{"text": "Do you remember how much I spent at Joe's Grill or what my dinner receipt had?"}]
+      }
+    },
+    {
+      "eval_case_id": "memory_list_all",
+      "prompt": {
+        "role": "user",
+        "parts": [{"text": "List all the visual memories and documents you have stored in my vault."}]
       }
     }
   ]
 }
+

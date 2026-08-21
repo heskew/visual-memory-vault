@@ -5,7 +5,7 @@ import shutil
 import subprocess
 import time
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 import httpx
 from cryptography.hazmat.primitives.asymmetric import ed25519
@@ -25,7 +25,7 @@ def get_flair_target() -> str:
     )
 
 
-def _get_key_bytes(agent_id: Optional[str] = None) -> Optional[tuple[str, bytes]]:
+def _get_key_bytes(agent_id: str | None = None) -> tuple[str, bytes] | None:
     """Retrieve raw 32-byte Ed25519 private key seed and the effective agent ID."""
     aid = agent_id or get_flair_agent_id()
 
@@ -87,18 +87,22 @@ def _get_key_bytes(agent_id: Optional[str] = None) -> Optional[tuple[str, bytes]
     return None
 
 
-def _sign_header(method: str, path: str, agent_id: Optional[str] = None) -> Optional[tuple[str, str]]:
+def _sign_header(
+    method: str, path: str, agent_id: str | None = None
+) -> tuple[str, str] | None:
     """Generates (effective_agent_id, Authorization header) for Flair REST."""
     key_info = _get_key_bytes(agent_id)
     if not key_info:
-        logger.debug("No valid 32-byte key found for agent %s", agent_id or get_flair_agent_id())
+        logger.debug(
+            "No valid 32-byte key found for agent %s", agent_id or get_flair_agent_id()
+        )
         return None
     effective_agent, raw_key = key_info
     try:
         priv_key = ed25519.Ed25519PrivateKey.from_private_bytes(raw_key)
         ts = str(int(time.time() * 1000))
         nonce = str(uuid.uuid4())
-        payload = f"{effective_agent}:{ts}:{nonce}:{method}:{path}".encode("utf-8")
+        payload = f"{effective_agent}:{ts}:{nonce}:{method}:{path}".encode()
         sig = base64.b64encode(priv_key.sign(payload)).decode("utf-8")
         return effective_agent, f"TPS-Ed25519 {effective_agent}:{ts}:{nonce}:{sig}"
     except Exception as e:
@@ -109,10 +113,10 @@ def _sign_header(method: str, path: str, agent_id: Optional[str] = None) -> Opti
 def store_memory(
     subject: str,
     content: str,
-    tags: Optional[List[str]] = None,
+    tags: list[str] | None = None,
     durability: str = "persistent",
-    visibility: Optional[str] = None,
-) -> Dict[str, Any]:
+    visibility: str | None = None,
+) -> dict[str, Any]:
     """Store a memory row in FLAIR for the agent."""
     mem_id = str(uuid.uuid4())
     path = f"/Memory/{mem_id}"
@@ -123,7 +127,7 @@ def store_memory(
         effective_agent, auth = sign_result
         try:
             url = f"{target.rstrip('/')}{path}"
-            body: Dict[str, Any] = {
+            body: dict[str, Any] = {
                 "id": mem_id,
                 "agentId": effective_agent,
                 "subject": subject,
@@ -195,7 +199,7 @@ def store_memory(
     }
 
 
-def search_memories(query: str, limit: int = 5) -> Dict[str, Any]:
+def search_memories(query: str, limit: int = 5) -> dict[str, Any]:
     """Search FLAIR memory using semantic search."""
     path = "/SemanticSearch"
     target = get_flair_target()
@@ -250,14 +254,14 @@ def search_memories(query: str, limit: int = 5) -> Dict[str, Any]:
     }
 
 
-def list_memories(limit: int = 20) -> Dict[str, Any]:
+def list_memories(limit: int = 20) -> dict[str, Any]:
     """List stored memories in FLAIR."""
     path = "/Memory"
     target = get_flair_target()
     sign_result = _sign_header("GET", path)
 
     if sign_result:
-        effective_agent, auth = sign_result
+        _effective_agent, auth = sign_result
         try:
             url = f"{target.rstrip('/')}{path}"
             with httpx.Client(timeout=15.0) as client:
@@ -292,6 +296,3 @@ def list_memories(limit: int = 20) -> Dict[str, Any]:
         "status": "error",
         "message": "No valid FLAIR authentication key or CLI available",
     }
-
-
-

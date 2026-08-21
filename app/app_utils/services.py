@@ -38,6 +38,7 @@ _AGENT_DIR = os.path.dirname(
 
 try:
     import adk_flair
+
     adk_flair.register()
 except Exception:
     pass

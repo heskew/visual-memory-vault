@@ -1,8 +1,8 @@
 """FastAPI proxy with API Key Authentication, Private GCS Image Persistence & Secure Authenticated Image Serving."""
 
-import base64
 import os
 import uuid
+from typing import Annotated
 
 import google.auth
 import google.auth.transport.requests
@@ -16,7 +16,16 @@ from a2a.types import (
     SendMessageConfiguration,
     SendMessageRequest,
 )
-from fastapi import FastAPI, File, Header, HTTPException, Request, Response, UploadFile
+from fastapi import (
+    FastAPI,
+    File,
+    Form,
+    Header,
+    HTTPException,
+    Request,
+    Response,
+    UploadFile,
+)
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from google.cloud import storage
@@ -28,7 +37,9 @@ RESOURCE = os.environ.get(
 )
 AGENT_DIRECTORY = os.environ.get("AGENT_DIRECTORY", "app")
 LOCATION = (
-    RESOURCE.split("/locations/")[1].split("/")[0] if "/locations/" in RESOURCE else "us-east1"
+    RESOURCE.split("/locations/")[1].split("/")[0]
+    if "/locations/" in RESOURCE
+    else "us-east1"
 )
 GCS_BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME", "bwg3-qwiklabs-gcp-04-4fe84a121fc3")
 
@@ -116,9 +127,17 @@ def _extract_parts(parts: list) -> list[dict]:
 
         data = getattr(p, "data", None) if not isinstance(p, dict) else p.get("data")
         if data is not None:
-            meta = getattr(p, "metadata", None) if not isinstance(p, dict) else p.get("metadata")
+            meta = (
+                getattr(p, "metadata", None)
+                if not isinstance(p, dict)
+                else p.get("metadata")
+            )
             meta = meta or {}
-            mime = meta.get("mimeType") if isinstance(meta, dict) else getattr(meta, "mime_type", None)
+            mime = (
+                meta.get("mimeType")
+                if isinstance(meta, dict)
+                else getattr(meta, "mime_type", None)
+            )
             if mime == _A2UI_MIME:
                 out.append({"kind": "a2ui", "data": data})
     return out
@@ -163,9 +182,9 @@ async def chat(req: Request):
 @app.post("/upload")
 async def upload_image(
     req: Request,
-    file: UploadFile = File(...),
-    subject: str | None = None,
-    x_api_key: str | None = Header(None),
+    file: Annotated[UploadFile, File(...)],
+    subject: Annotated[str | None, Form()] = None,
+    x_api_key: Annotated[str | None, Header()] = None,
 ):
     """Endpoint for iOS Shortcuts and mobile apps to upload photos/screenshots."""
     verify_api_key(req, x_api_key)
@@ -261,13 +280,14 @@ async def get_media(
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to retrieve image: {e}")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to retrieve image: {e}"
+        ) from e
 
 
 static_dir = "static" if os.path.exists("static") else "frontend/static"
 if os.path.exists(static_dir):
     app.mount("/", StaticFiles(directory=static_dir, html=True), name="static")
-
 
 
 if __name__ == "__main__":

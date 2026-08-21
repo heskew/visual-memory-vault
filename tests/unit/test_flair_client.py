@@ -64,7 +64,7 @@ def test_get_key_bytes_keyfile(monkeypatch, test_ed25519_key):
 
 
 def test_sign_header_success(monkeypatch, test_ed25519_key):
-    raw_key, b64_key = test_ed25519_key
+    _raw_key, b64_key = test_ed25519_key
     monkeypatch.setenv("FLAIR_PRIVATE_KEY_B64", b64_key)
     monkeypatch.setenv("FLAIR_AGENT_ID", "vault-bot")
 
