@@ -1,35 +1,27 @@
+import asyncio
 import logging
 import uuid
 from typing import Any
 
-import httpx
-from adk_flair.memory_service import _sign_request
+from google.adk.memory.memory_entry import MemoryEntry
+from google.genai import types
 
 from app.app_utils import services
 
 logger = logging.getLogger(__name__)
 
 
-def _sync_request(
-    method: str,
-    path: str,
-    json_body: dict[str, Any] | None = None,
-    params: dict[str, Any] | None = None,
-) -> Any:
-    """Execute a synchronous signed request to Harper Fabric / Flair."""
-    svc = services.get_memory_service()
-    if not hasattr(svc, "_private_key") or not hasattr(svc, "_url"):
-        raise RuntimeError("Flair memory service credentials unavailable")
+def _run_coro(coro):
+    """Run an async coroutine safely from synchronous tool functions."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
 
-    auth = _sign_request(svc._private_key, svc._agent_id, method, path)
-    headers = {"Authorization": auth, "Content-Type": "application/json"}
+    import nest_asyncio
 
-    with httpx.Client(base_url=svc._url, timeout=30.0) as client:
-        resp = client.request(
-            method=method, url=path, json=json_body, params=params, headers=headers
-        )
-        resp.raise_for_status()
-        return resp.json() if resp.content else {}
+    nest_asyncio.apply()
+    return loop.run_until_complete(coro)
 
 
 def store_visual_memory(
@@ -46,30 +38,31 @@ def store_visual_memory(
         tags: Optional list of category tags (e.g. ['wifi', 'hotel', 'receipt', 'travel']).
         image_url: Optional public URL of the original stored image file.
     """
-    svc = services.get_memory_service()
-    agent_id = getattr(svc, "_agent_id", "visual-memory-vault")
+    mem_service = services.get_memory_service()
     mem_id = str(uuid.uuid4())
     content = f"Subject: {subject}\n{description}"
     if image_url:
         content += f"\nOriginal Image: {image_url}"
 
-    body = {
-        "id": mem_id,
-        "agentId": agent_id,
-        "subject": subject,
-        "content": content,
-        "durability": "persistent",
-        "visibility": "shared",
-        "tags": tags or ["adk:visual-memory-vault:user"],
-    }
+    entry = MemoryEntry(
+        id=mem_id,
+        content=types.Content(role="model", parts=[types.Part(text=content)]),
+    )
 
     try:
-        res = _sync_request("POST", "/Memory/", json_body=body)
+        _run_coro(
+            mem_service.add_memory(
+                app_name="visual-memory-vault",
+                user_id="user",
+                memories=[entry],
+                durability="persistent",
+                visibility="shared",
+            )
+        )
         return {
             "status": "success",
-            "id": res.get("id") or mem_id,
+            "id": mem_id,
             "subject": subject,
-            "output": res,
         }
     except Exception as exc:
         logger.error("store_visual_memory error: %s", exc)
@@ -83,33 +76,34 @@ def search_visual_memories(query: str, limit: int = 5) -> dict[str, Any]:
         query: The search question or keywords (e.g. 'hotel wifi password', 'book recommendations').
         limit: Maximum number of memory results to return.
     """
+    mem_service = services.get_memory_service()
     try:
-        # Search via GET /Memory/?q=... or vector search
-        records = _sync_request("GET", "/Memory/")
-        matched = []
-        q_lower = query.lower()
-        for r in records:
-            text = f"{r.get('subject', '')} {r.get('content', '')}".lower()
-            if any(term in text for term in q_lower.split()):
-                matched.append(
-                    {
-                        "id": r.get("id"),
-                        "subject": r.get("subject"),
-                        "content": r.get("content"),
-                        "createdAt": r.get("createdAt"),
-                    }
-                )
-        return {"status": "success", "results": matched[:limit]}
+        resp = _run_coro(
+            mem_service.search_memory(
+                app_name="visual-memory-vault",
+                user_id="user",
+                query=query,
+            )
+        )
+        results = []
+        for m in resp.memories[:limit]:
+            text = ""
+            if m.content and m.content.parts:
+                text = " ".join(p.text for p in m.content.parts if p.text)
+            results.append(
+                {
+                    "id": m.id,
+                    "content": text,
+                    "timestamp": m.timestamp,
+                }
+            )
+        return {"status": "success", "results": results}
     except Exception as exc:
         logger.error("search_visual_memories error: %s", exc)
         return {"status": "error", "message": str(exc)}
 
 
-def list_visual_memories() -> dict[str, Any]:
-    """List all stored visual memories in the Flair memory bank."""
-    try:
-        records = _sync_request("GET", "/Memory/")
-        return {"status": "success", "memories": records}
-    except Exception as exc:
-        logger.error("list_visual_memories error: %s", exc)
-        return {"status": "error", "message": str(exc)}
+def list_visual_memories(limit: int = 20) -> dict[str, Any]:
+    """List recent stored visual memories in the Flair memory bank."""
+    # Searches broadly across the app+user scope using semantic search
+    return search_visual_memories(query="*", limit=limit)

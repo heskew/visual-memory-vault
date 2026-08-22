@@ -1,12 +1,18 @@
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
+
+from google.adk.memory.base_memory_service import SearchMemoryResponse
+from google.adk.memory.memory_entry import MemoryEntry
+from google.genai import types
 
 from app import tools
+from app.app_utils import services
 
 
 def test_store_visual_memory_success():
-    with patch.object(
-        tools, "_sync_request", return_value={"id": "1", "written": True}
-    ):
+    mock_service = MagicMock()
+    mock_service.add_memory = AsyncMock(return_value=None)
+
+    with patch.object(services, "get_memory_service", return_value=mock_service):
         res = tools.store_visual_memory(
             subject="Receipt",
             description="Coffee $5.00",
@@ -16,18 +22,23 @@ def test_store_visual_memory_success():
         assert res["status"] == "success"
         assert res["subject"] == "Receipt"
         assert "id" in res
+        mock_service.add_memory.assert_awaited_once()
 
 
 def test_search_visual_memories_success():
-    records = [
-        {
-            "id": "mem-1",
-            "subject": "Wifi",
-            "content": "Subject: Wifi\nPassword: 123",
-            "createdAt": "2026-08-22T00:00:00Z",
-        }
-    ]
-    with patch.object(tools, "_sync_request", return_value=records):
+    mock_service = MagicMock()
+    mock_entry = MemoryEntry(
+        id="mem-1",
+        content=types.Content(
+            role="model", parts=[types.Part(text="Subject: Wifi\nPassword: 123")]
+        ),
+        timestamp="2026-08-22T00:00:00Z",
+    )
+    mock_service.search_memory = AsyncMock(
+        return_value=SearchMemoryResponse(memories=[mock_entry])
+    )
+
+    with patch.object(services, "get_memory_service", return_value=mock_service):
         res = tools.search_visual_memories("Wifi")
         assert res["status"] == "success"
         assert len(res["results"]) == 1
@@ -36,9 +47,18 @@ def test_search_visual_memories_success():
 
 
 def test_list_visual_memories_success():
-    records = [{"id": "1", "subject": "Test"}]
-    with patch.object(tools, "_sync_request", return_value=records):
+    mock_service = MagicMock()
+    mock_entry = MemoryEntry(
+        id="mem-1",
+        content=types.Content(role="model", parts=[types.Part(text="Subject: Test")]),
+        timestamp="2026-08-22T00:00:00Z",
+    )
+    mock_service.search_memory = AsyncMock(
+        return_value=SearchMemoryResponse(memories=[mock_entry])
+    )
+
+    with patch.object(services, "get_memory_service", return_value=mock_service):
         res = tools.list_visual_memories()
         assert res["status"] == "success"
-        assert len(res["memories"]) == 1
-        assert res["memories"][0]["id"] == "1"
+        assert len(res["results"]) == 1
+        assert res["results"][0]["id"] == "mem-1"
