@@ -49,16 +49,16 @@ wheels = [
 
 [[package]]
 name = "adk-flair"
-version = "0.46.0"
+version = "0.47.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "cryptography" },
     { name = "google-adk" },
     { name = "httpx" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/7e/7f/2b3963fa592b412a6ff672c719547cfc694582cc9f8154a8ca41d40f23f6/adk_flair-0.46.0.tar.gz", hash = "sha256:2da5a38c563773437e6a74876a3d352e8e49061d569257d08b031fb219b29bf1", size = 14278, upload-time = "2026-08-20T18:09:43.633Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/58/71/2a3239248e666d6b74746819f87c6ae60c60701b06cac2b8fd9b1e9a135a/adk_flair-0.47.1.tar.gz", hash = "sha256:b883afb6817713ed398ea3fa3e4041bfd1bcd57a385e4c584c8ab43398511d74", size = 16057, upload-time = "2026-08-22T14:51:27.027Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/a3/54/ac2778753666ab7cfbd19564c7b3de81bda9bee5fe00a39df3b2c33b03cd/adk_flair-0.46.0-py3-none-any.whl", hash = "sha256:cf3e26d708d2f571e71eef73b1efddfc0748f2390f8d60f6190a2887e04519bd", size = 13561, upload-time = "2026-08-20T18:09:42.403Z" },
+    { url = "https://files.pythonhosted.org/packages/30/03/7d2af36292a4874c98b245df737949c86da097ed3237e8e68c96e70a2b4b/adk_flair-0.47.1-py3-none-any.whl", hash = "sha256:9d3d14ce1bcfe777e7f8fc40dc76e5e09964b4c461746f842baa8d383f4f3277", size = 15371, upload-time = "2026-08-22T14:51:25.874Z" },
 ]
 
 [[package]]
@@ -3324,7 +3324,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "a2a-sdk", extras = ["http-server"], specifier = ">=1.0,<2" },
-    { name = "adk-flair", specifier = ">=0.46.0" },
+    { name = "adk-flair", specifier = ">=0.47.1" },
     { name = "aiohttp", specifier = ">=3.13.4" },
     { name = "codespell", marker = "extra == 'lint'", specifier = ">=2.2.0,<3.0.0" },
     { name = "cryptography", specifier = ">=42.0.0" },

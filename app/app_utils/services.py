@@ -44,24 +44,7 @@ _AGENT_DIR = os.path.dirname(
 
 try:
     import adk_flair
-    import httpx
 
-    # Temporary workaround: enforce remote-safe timeout on FlairMemoryService._http
-    def _get_http(self):
-        if self._client is None:
-            timeout_sec = float(os.environ.get("FLAIR_TIMEOUT_SECONDS", "30.0"))
-            self._client = httpx.AsyncClient(
-                base_url=self._url,
-                timeout=httpx.Timeout(
-                    connect=min(5.0, timeout_sec),
-                    read=timeout_sec,
-                    write=min(15.0, timeout_sec),
-                    pool=5.0,
-                ),
-            )
-        return self._client
-
-    adk_flair.memory_service.FlairMemoryService._http = property(_get_http)
     adk_flair.register()
 except Exception as e:
     logger.debug("adk_flair registration notice: %s", e)
@@ -140,25 +123,14 @@ def get_memory_service():
     if keyfile and os.path.exists(keyfile):
         try:
             import adk_flair
-            import httpx
 
-            svc = adk_flair.FlairMemoryService(
+            timeout_sec = float(os.environ.get("FLAIR_TIMEOUT_SECONDS", "30.0"))
+            return adk_flair.FlairMemoryService(
                 url=flair_url,
                 agent_id=agent_id,
                 keyfile=keyfile,
+                timeout=timeout_sec,
             )
-            # Temporary workaround until adk-flair adds native remote timeout support
-            timeout_sec = float(os.environ.get("FLAIR_TIMEOUT_SECONDS", "30.0"))
-            svc._client = httpx.AsyncClient(
-                base_url=svc._url,
-                timeout=httpx.Timeout(
-                    connect=min(5.0, timeout_sec),
-                    read=timeout_sec,
-                    write=min(15.0, timeout_sec),
-                    pool=5.0,
-                ),
-            )
-            return svc
         except Exception as exc:
             logger.warning("Failed to initialize FlairMemoryService: %s", exc)
 
