@@ -10,7 +10,7 @@ from app.app_utils import services
 
 def test_store_visual_memory_success():
     mock_service = MagicMock()
-    mock_service.add_memory = AsyncMock()
+    mock_service._request = AsyncMock(return_value={"id": "1", "written": True})
 
     with patch.object(services, "get_memory_service", return_value=mock_service):
         res = tools.store_visual_memory(
@@ -22,7 +22,6 @@ def test_store_visual_memory_success():
         assert res["status"] == "success"
         assert res["subject"] == "Receipt"
         assert "id" in res
-        mock_service.add_memory.assert_awaited_once()
 
 
 def test_search_visual_memories_success():

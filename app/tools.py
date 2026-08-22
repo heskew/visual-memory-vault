@@ -40,13 +40,35 @@ def store_visual_memory(
     if image_url:
         content += f"\nOriginal Image: {image_url}"
 
-    entry = MemoryEntry(
-        id=mem_id,
-        content=types.Content(role="model", parts=[types.Part(text=content)]),
-    )
+    if hasattr(mem_service, "_request"):
+        try:
+            body = {
+                "id": mem_id,
+                "agentId": getattr(mem_service, "_agent_id", "visual-memory-vault"),
+                "subject": subject,
+                "content": content,
+                "durability": "persistent",
+                "visibility": "shared",
+                "tags": tags or ["adk:visual-memory-vault:user"],
+            }
+            res = _run_async(
+                mem_service._request("PUT", f"/Memory/{mem_id}", json_body=body)
+            )
+            return {
+                "status": "success",
+                "id": mem_id,
+                "subject": subject,
+                "output": res,
+            }
+        except Exception as exc:
+            return {"status": "error", "message": f"Memory store failed: {exc}"}
 
     if hasattr(mem_service, "add_memory"):
         try:
+            entry = MemoryEntry(
+                id=mem_id,
+                content=types.Content(role="model", parts=[types.Part(text=content)]),
+            )
             _run_async(
                 mem_service.add_memory(
                     app_name="visual-memory-vault",

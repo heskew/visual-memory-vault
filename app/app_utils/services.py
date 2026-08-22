@@ -41,10 +41,27 @@ _AGENT_DIR = os.path.dirname(
 
 try:
     import adk_flair
+    import httpx
 
+    # Temporary workaround: enforce remote-safe timeout on FlairMemoryService._http
+    def _get_http(self):
+        if self._client is None:
+            timeout_sec = float(os.environ.get("FLAIR_TIMEOUT_SECONDS", "30.0"))
+            self._client = httpx.AsyncClient(
+                base_url=self._url,
+                timeout=httpx.Timeout(
+                    connect=min(5.0, timeout_sec),
+                    read=timeout_sec,
+                    write=min(15.0, timeout_sec),
+                    pool=5.0,
+                ),
+            )
+        return self._client
+
+    adk_flair.memory_service.FlairMemoryService._http = property(_get_http)
     adk_flair.register()
-except Exception:
-    pass
+except Exception as e:
+    logger.debug("adk_flair registration notice: %s", e)
 
 
 @functools.cache
