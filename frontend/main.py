@@ -183,6 +183,35 @@ async def chat(req: Request):
     return JSONResponse({"parts": parts})
 
 
+import io
+from PIL import Image
+
+try:
+    import pillow_heif
+
+    pillow_heif.register_heif_opener()
+except ImportError:
+    pass
+
+
+def normalize_image(
+    file_bytes: bytes, filename: str, content_type: str | None
+) -> tuple[bytes, str, str]:
+    """Convert HEIC/HEIF and raw image formats to standard RGB JPEG for Gemini."""
+    try:
+        image = Image.open(io.BytesIO(file_bytes))
+        if image.mode != "RGB":
+            image = image.convert("RGB")
+        out = io.BytesIO()
+        image.save(out, format="JPEG", quality=90)
+        jpeg_bytes = out.getvalue()
+        base_name = os.path.splitext(filename)[0]
+        return jpeg_bytes, f"{base_name}.jpg", "image/jpeg"
+    except Exception as exc:
+        print(f"Warning: Image normalization note: {exc}")
+        return file_bytes, filename, content_type or "image/jpeg"
+
+
 @app.post("/upload")
 async def upload_image(
     req: Request,
@@ -192,8 +221,13 @@ async def upload_image(
 ):
     """Endpoint for iOS Shortcuts and mobile apps to upload photos/screenshots."""
     verify_api_key(req, x_api_key)
-    file_bytes = await file.read()
-    filename = file.filename or "uploaded_photo.jpg"
+    raw_bytes = await file.read()
+    raw_filename = file.filename or "uploaded_photo.jpg"
+
+    # Normalize HEIC / iOS images to clean JPEG
+    file_bytes, filename, media_type = normalize_image(
+        raw_bytes, raw_filename, file.content_type
+    )
 
     # 1. Save original photo (local disk + optional GCS)
     image_name = f"{uuid.uuid4()}_{filename}"
@@ -214,9 +248,7 @@ async def upload_image(
             if gcs:
                 bucket = gcs.bucket(GCS_BUCKET_NAME)
                 blob = bucket.blob(blob_id)
-                blob.upload_from_string(
-                    file_bytes, content_type=file.content_type or "image/jpeg"
-                )
+                blob.upload_from_string(file_bytes, content_type=media_type)
         except Exception as e:
             print(f"Warning: Failed to upload image to GCS: {e}")
 
@@ -241,7 +273,7 @@ async def upload_image(
                 Part(text=prompt),
                 Part(
                     raw=file_bytes,
-                    media_type=file.content_type or "image/jpeg",
+                    media_type=media_type,
                     filename=filename,
                 ),
             ],
@@ -276,7 +308,7 @@ async def upload_image(
     )
 
 
-@app.get("/media/{image_name}")
+@app.api_route("/media/{image_name}", methods=["GET", "HEAD"])
 async def get_media(
     image_name: str, req: Request, x_api_key: str | None = Header(None)
 ):
