@@ -25,6 +25,9 @@ import functools
 import logging
 import os
 
+os.environ.setdefault("FLAIR_ALLOW_REMOTE_URL", "1")
+os.environ.setdefault("FLAIR_TIMEOUT_SECONDS", "30.0")
+
 from google.adk.artifacts import GcsArtifactService, InMemoryArtifactService
 from google.adk.cli.service_registry import get_service_registry
 from google.adk.cli.utils.service_factory import create_session_service_from_options
@@ -113,10 +116,16 @@ def get_memory_service():
             keyfile = os.path.expanduser("~/.flair/keys/local.key")
             agent_id = "local"
         elif b64_key := os.environ.get("FLAIR_PRIVATE_KEY_B64"):
+            import base64
             import tempfile
 
-            tmp = tempfile.NamedTemporaryFile("w", delete=False, suffix=".key")
-            tmp.write(b64_key.strip())
+            try:
+                raw_bytes = base64.b64decode(b64_key.strip())
+            except Exception:
+                raw_bytes = b64_key.strip().encode("utf-8")
+
+            tmp = tempfile.NamedTemporaryFile("wb", delete=False, suffix=".key")
+            tmp.write(raw_bytes)
             tmp.close()
             keyfile = tmp.name
 
