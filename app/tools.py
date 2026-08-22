@@ -64,10 +64,10 @@ def store_visual_memory(
     }
 
     try:
-        res = _sync_request("PUT", f"/Memory/{mem_id}", json_body=body)
+        res = _sync_request("POST", "/Memory/", json_body=body)
         return {
             "status": "success",
-            "id": mem_id,
+            "id": res.get("id") or mem_id,
             "subject": subject,
             "output": res,
         }
