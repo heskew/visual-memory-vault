@@ -32,19 +32,27 @@ def _run_sync(coro):
     return loop.run_until_complete(coro)
 
 
+def _get_runtime_tools():
+    svc = services.get_memory_service()
+    return create_flair_tools(svc, app_name="visual-memory-vault", user_id="user")
+
+
 @functools.wraps(_async_store)
 def store_memory(*args: Any, **kwargs: Any) -> dict:
-    return _run_sync(_async_store(*args, **kwargs))
+    tools = _get_runtime_tools()
+    return _run_sync(tools[0](*args, **kwargs))
 
 
 @functools.wraps(_async_search)
 def search_memory(*args: Any, **kwargs: Any) -> dict:
-    return _run_sync(_async_search(*args, **kwargs))
+    tools = _get_runtime_tools()
+    return _run_sync(tools[1](*args, **kwargs))
 
 
 @functools.wraps(_async_list)
 def list_memories(*args: Any, **kwargs: Any) -> dict:
-    return _run_sync(_async_list(*args, **kwargs))
+    tools = _get_runtime_tools()
+    return _run_sync(tools[2](*args, **kwargs))
 
 
 flair_tools = [store_memory, search_memory, list_memories]

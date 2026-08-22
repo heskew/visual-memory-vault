@@ -81,7 +81,6 @@ def get_artifact_service():
     return InMemoryArtifactService()
 
 
-@functools.cache
 def get_memory_service():
     """Process-wide memory service: FlairMemoryService if available, else InMemoryMemoryService."""
     flair_url = (
@@ -91,26 +90,29 @@ def get_memory_service():
     )
     agent_id = os.environ.get("FLAIR_AGENT_ID", "visual-memory-vault")
     keyfile = os.environ.get("FLAIR_KEYFILE")
-    if not keyfile:
+
+    # Priority 1: Base64 environment variable (used in cloud container / Reasoning Engine)
+    if b64_key := os.environ.get("FLAIR_PRIVATE_KEY_B64"):
+        import base64
+
+        try:
+            raw_bytes = base64.b64decode(b64_key.strip())
+        except Exception:
+            raw_bytes = b64_key.strip().encode("utf-8")
+
+        keyfile_path = "/tmp/flair_agent_key.key"
+        with open(keyfile_path, "wb") as f:
+            f.write(raw_bytes)
+        keyfile = keyfile_path
+
+    # Priority 2: Explicit keyfile path on disk
+    elif not keyfile:
         candidate = os.path.expanduser(f"~/.flair/keys/{agent_id}.key")
         if os.path.exists(candidate):
             keyfile = candidate
         elif os.path.exists(os.path.expanduser("~/.flair/keys/local.key")):
             keyfile = os.path.expanduser("~/.flair/keys/local.key")
             agent_id = "local"
-        elif b64_key := os.environ.get("FLAIR_PRIVATE_KEY_B64"):
-            import base64
-            import tempfile
-
-            try:
-                raw_bytes = base64.b64decode(b64_key.strip())
-            except Exception:
-                raw_bytes = b64_key.strip().encode("utf-8")
-
-            tmp = tempfile.NamedTemporaryFile("wb", delete=False, suffix=".key")
-            tmp.write(raw_bytes)
-            tmp.close()
-            keyfile = tmp.name
 
     allow_remote = os.environ.get("FLAIR_ALLOW_REMOTE_URL") == "1" or not (
         "localhost" in flair_url or "127.0.0.1" in flair_url
@@ -118,7 +120,7 @@ def get_memory_service():
     if allow_remote:
         os.environ["FLAIR_ALLOW_REMOTE_URL"] = "1"
     if "FLAIR_TIMEOUT_SECONDS" not in os.environ:
-        os.environ["FLAIR_TIMEOUT_SECONDS"] = "15.0"
+        os.environ["FLAIR_TIMEOUT_SECONDS"] = "30.0"
 
     if keyfile and os.path.exists(keyfile):
         try:
