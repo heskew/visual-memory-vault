@@ -1,55 +1,57 @@
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
-from app.tools import (
-    list_visual_memories,
-    search_visual_memories,
-    store_visual_memory,
-)
+from google.adk.memory.base_memory_service import SearchMemoryResponse
+from google.adk.memory.memory_entry import MemoryEntry
+from google.genai import types
+
+from app import tools
+from app.app_utils import services
 
 
-def test_store_visual_memory_basic():
-    with patch("app.tools.store_memory") as mock_store:
-        mock_store.return_value = {"status": "success", "id": "test-1"}
-        res = store_visual_memory(
-            subject="Lunch Receipt",
-            description="Total: $15.50 at Chipotle",
-            tags=["receipt", "food"],
+def test_store_visual_memory_success():
+    mock_service = MagicMock()
+    mock_service.add_memory = AsyncMock()
+
+    with patch.object(services, "get_memory_service", return_value=mock_service):
+        res = tools.store_visual_memory(
+            subject="Receipt",
+            description="Coffee $5.00",
+            tags=["cafe"],
+            image_url="/media/coffee.jpg",
         )
         assert res["status"] == "success"
-        mock_store.assert_called_once_with(
-            subject="Lunch Receipt",
-            content="Total: $15.50 at Chipotle",
-            tags=["receipt", "food"],
-        )
+        assert res["subject"] == "Receipt"
+        assert "id" in res
+        mock_service.add_memory.assert_awaited_once()
 
 
-def test_store_visual_memory_with_image_url():
-    with patch("app.tools.store_memory") as mock_store:
-        mock_store.return_value = {"status": "success", "id": "test-2"}
-        res = store_visual_memory(
-            subject="Hotel Keycard",
-            description="Room 404, WiFi: guest123",
-            image_url="/media/hotel_key.jpg",
-        )
+def test_search_visual_memories_success():
+    mock_service = MagicMock()
+    mock_entry = MemoryEntry(
+        id="mem-1",
+        content=types.Content(
+            role="model", parts=[types.Part(text="Subject: Wifi\nPassword: 123")]
+        ),
+        timestamp="2026-08-22T00:00:00Z",
+    )
+    mock_service.search_memory = AsyncMock(
+        return_value=SearchMemoryResponse(memories=[mock_entry])
+    )
+
+    with patch.object(services, "get_memory_service", return_value=mock_service):
+        res = tools.search_visual_memories("Wifi")
         assert res["status"] == "success"
-        mock_store.assert_called_once_with(
-            subject="Hotel Keycard",
-            content="Room 404, WiFi: guest123\nOriginal Image: /media/hotel_key.jpg",
-            tags=None,
-        )
+        assert len(res["results"]) == 1
+        assert res["results"][0]["id"] == "mem-1"
+        assert "Password: 123" in res["results"][0]["content"]
 
 
-def test_search_visual_memories():
-    with patch("app.tools.search_memories") as mock_search:
-        mock_search.return_value = {"status": "success", "results": "WiFi: guest123"}
-        res = search_visual_memories(query="hotel wifi", limit=3)
+def test_list_visual_memories_success():
+    mock_service = MagicMock()
+    mock_service._request = AsyncMock(return_value=[{"id": "1", "subject": "Test"}])
+
+    with patch.object(services, "get_memory_service", return_value=mock_service):
+        res = tools.list_visual_memories()
         assert res["status"] == "success"
-        mock_search.assert_called_once_with(query="hotel wifi", limit=3)
-
-
-def test_list_visual_memories():
-    with patch("app.tools.list_memories") as mock_list:
-        mock_list.return_value = {"status": "success", "memories": "All memories"}
-        res = list_visual_memories()
-        assert res["status"] == "success"
-        mock_list.assert_called_once()
+        assert len(res["memories"]) == 1
+        assert res["memories"][0]["id"] == "1"

@@ -22,11 +22,14 @@ is visible to the others.
 from __future__ import annotations
 
 import functools
+import logging
 import os
 
 from google.adk.artifacts import GcsArtifactService, InMemoryArtifactService
 from google.adk.cli.service_registry import get_service_registry
 from google.adk.cli.utils.service_factory import create_session_service_from_options
+
+logger = logging.getLogger(__name__)
 
 SESSION_SERVICE_URI = "shared://session"
 ARTIFACT_SERVICE_URI = "shared://artifact"
@@ -92,10 +95,21 @@ def get_memory_service():
         elif os.path.exists(os.path.expanduser("~/.flair/keys/local.key")):
             keyfile = os.path.expanduser("~/.flair/keys/local.key")
             agent_id = "local"
+        elif b64_key := os.environ.get("FLAIR_PRIVATE_KEY_B64"):
+            import tempfile
+
+            tmp = tempfile.NamedTemporaryFile("w", delete=False, suffix=".key")
+            tmp.write(b64_key.strip())
+            tmp.close()
+            keyfile = tmp.name
 
     allow_remote = os.environ.get("FLAIR_ALLOW_REMOTE_URL") == "1" or not (
         "localhost" in flair_url or "127.0.0.1" in flair_url
     )
+    if allow_remote:
+        os.environ["FLAIR_ALLOW_REMOTE_URL"] = "1"
+    if "FLAIR_TIMEOUT_SECONDS" not in os.environ:
+        os.environ["FLAIR_TIMEOUT_SECONDS"] = "15.0"
 
     if keyfile and os.path.exists(keyfile):
         try:
@@ -105,10 +119,9 @@ def get_memory_service():
                 url=flair_url,
                 agent_id=agent_id,
                 keyfile=keyfile,
-                allow_remote_url=allow_remote,
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("Failed to initialize FlairMemoryService: %s", exc)
 
     from google.adk.memory.in_memory_memory_service import InMemoryMemoryService
 

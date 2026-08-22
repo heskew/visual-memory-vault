@@ -1,6 +1,23 @@
+import asyncio
+import concurrent.futures
+import uuid
 from typing import Any
 
-from app.flair_client import list_memories, search_memories, store_memory
+from google.adk.memory.memory_entry import MemoryEntry
+from google.genai import types
+
+from app.app_utils import services
+
+
+def _run_async(coro):
+    """Safely execute an async coroutine from synchronous tool functions."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        return executor.submit(asyncio.run, coro).result()
 
 
 def store_visual_memory(
@@ -17,10 +34,36 @@ def store_visual_memory(
         tags: Optional list of category tags (e.g. ['wifi', 'hotel', 'receipt', 'travel']).
         image_url: Optional public URL of the original stored image file.
     """
-    content = description
+    mem_service = services.get_memory_service()
+    mem_id = str(uuid.uuid4())
+    content = f"Subject: {subject}\n{description}"
     if image_url:
-        content = f"{description}\nOriginal Image: {image_url}"
-    return store_memory(subject=subject, content=content, tags=tags)
+        content += f"\nOriginal Image: {image_url}"
+
+    entry = MemoryEntry(
+        id=mem_id,
+        content=types.Content(role="model", parts=[types.Part(text=content)]),
+    )
+
+    if hasattr(mem_service, "add_memory"):
+        try:
+            _run_async(
+                mem_service.add_memory(
+                    app_name="visual-memory-vault",
+                    user_id="user",
+                    memories=[entry],
+                    durability="persistent",
+                    visibility="shared",
+                )
+            )
+            return {"status": "success", "id": mem_id, "subject": subject}
+        except Exception as exc:
+            return {"status": "error", "message": str(exc)}
+
+    return {
+        "status": "error",
+        "message": "Memory service does not support direct writes",
+    }
 
 
 def search_visual_memories(query: str, limit: int = 5) -> dict[str, Any]:
@@ -30,9 +73,60 @@ def search_visual_memories(query: str, limit: int = 5) -> dict[str, Any]:
         query: The search question or keywords (e.g. 'hotel wifi password', 'book recommendations').
         limit: Maximum number of memory results to return.
     """
-    return search_memories(query=query, limit=limit)
+    mem_service = services.get_memory_service()
+    if hasattr(mem_service, "search_memory"):
+        try:
+            res = _run_async(
+                mem_service.search_memory(
+                    app_name="visual-memory-vault",
+                    user_id="user",
+                    query=query,
+                )
+            )
+            memories = []
+            for m in res.memories[:limit]:
+                text = ""
+                if m.content and m.content.parts:
+                    text = " ".join(p.text for p in m.content.parts if p.text)
+                memories.append({"id": m.id, "content": text, "timestamp": m.timestamp})
+            return {"status": "success", "results": memories}
+        except Exception as exc:
+            return {"status": "error", "message": str(exc)}
+
+    return {"status": "error", "message": "Memory service does not support search"}
 
 
 def list_visual_memories() -> dict[str, Any]:
     """List all stored visual memories in the Flair memory bank."""
-    return list_memories()
+    mem_service = services.get_memory_service()
+    if hasattr(mem_service, "_request"):
+        try:
+            records = _run_async(mem_service._request("GET", "/Memory/"))
+            return {"status": "success", "memories": records}
+        except Exception as exc:
+            return {"status": "error", "message": str(exc)}
+
+    if hasattr(mem_service, "search_memory"):
+        try:
+            res = _run_async(
+                mem_service.search_memory(
+                    app_name="visual-memory-vault",
+                    user_id="user",
+                    query="*",
+                )
+            )
+            return {
+                "status": "success",
+                "memories": [
+                    {
+                        "id": m.id,
+                        "content": " ".join(p.text for p in m.content.parts if p.text),
+                    }
+                    for m in res.memories
+                    if m.content and m.content.parts
+                ],
+            }
+        except Exception as exc:
+            return {"status": "error", "message": str(exc)}
+
+    return {"status": "error", "message": "Memory service unavailable"}
