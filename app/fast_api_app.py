@@ -42,6 +42,7 @@ try:
     logger = logging_client.logger(__name__)
 except Exception:
     import logging
+
     logger = logging.getLogger(__name__)
 
 allow_origins = (

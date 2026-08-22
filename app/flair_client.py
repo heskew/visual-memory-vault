@@ -36,10 +36,13 @@ def _get_key_bytes(agent_id: str | None = None) -> tuple[str, bytes] | None:
         if os.path.exists(exp_path):
             try:
                 with open(exp_path, "rb") as f:
-                    content = f.read().strip()
+                    content = f.read()
                     if len(content) == 32:
                         return aid, content
-                    raw = base64.b64decode(content)
+                    cleaned = content.strip()
+                    if len(cleaned) == 32:
+                        return aid, cleaned
+                    raw = base64.b64decode(cleaned)
                     if len(raw) == 32:
                         return aid, raw
             except Exception as e:
@@ -61,10 +64,13 @@ def _get_key_bytes(agent_id: str | None = None) -> tuple[str, bytes] | None:
     if os.path.exists(key_path):
         try:
             with open(key_path, "rb") as f:
-                content = f.read().strip()
+                content = f.read()
                 if len(content) == 32:
                     return aid, content
-                raw = base64.b64decode(content)
+                cleaned = content.strip()
+                if len(cleaned) == 32:
+                    return aid, cleaned
+                raw = base64.b64decode(cleaned)
                 if len(raw) == 32:
                     return aid, raw
         except Exception as e:
@@ -75,10 +81,13 @@ def _get_key_bytes(agent_id: str | None = None) -> tuple[str, bytes] | None:
     if os.path.exists(local_key_path):
         try:
             with open(local_key_path, "rb") as f:
-                content = f.read().strip()
+                content = f.read()
                 if len(content) == 32:
                     return "local", content
-                raw = base64.b64decode(content)
+                cleaned = content.strip()
+                if len(cleaned) == 32:
+                    return "local", cleaned
+                raw = base64.b64decode(cleaned)
                 if len(raw) == 32:
                     return "local", raw
         except Exception as e:
