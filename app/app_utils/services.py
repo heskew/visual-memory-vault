@@ -127,12 +127,34 @@ def get_memory_service():
             import adk_flair
 
             timeout_sec = float(os.environ.get("FLAIR_TIMEOUT_SECONDS", "30.0"))
-            return adk_flair.FlairMemoryService(
+            svc = adk_flair.FlairMemoryService(
                 url=flair_url,
                 agent_id=agent_id,
                 keyfile=keyfile,
                 timeout=timeout_sec,
             )
+
+            orig_request = svc._request
+
+            async def _diag_request(method, path, **kwargs):
+                try:
+                    return await orig_request(method, path, **kwargs)
+                except Exception as exc:
+                    logger.error(
+                        "Flair request failed: %s %s -> base_url=%s agent_id=%s keyfile=%s (exists=%s, size=%s) exc=%s",
+                        method,
+                        path,
+                        svc._url,
+                        svc._agent_id,
+                        keyfile,
+                        os.path.exists(keyfile),
+                        os.path.getsize(keyfile) if os.path.exists(keyfile) else 0,
+                        exc,
+                    )
+                    raise
+
+            svc._request = _diag_request
+            return svc
         except Exception as exc:
             logger.warning("Failed to initialize FlairMemoryService: %s", exc)
 
