@@ -114,12 +114,25 @@ def get_memory_service():
     if keyfile and os.path.exists(keyfile):
         try:
             import adk_flair
+            import httpx
 
-            return adk_flair.FlairMemoryService(
+            svc = adk_flair.FlairMemoryService(
                 url=flair_url,
                 agent_id=agent_id,
                 keyfile=keyfile,
             )
+            # Temporary workaround until adk-flair adds native remote timeout support
+            timeout_sec = float(os.environ.get("FLAIR_TIMEOUT_SECONDS", "30.0"))
+            svc._client = httpx.AsyncClient(
+                base_url=svc._url,
+                timeout=httpx.Timeout(
+                    connect=min(5.0, timeout_sec),
+                    read=timeout_sec,
+                    write=min(15.0, timeout_sec),
+                    pool=5.0,
+                ),
+            )
+            return svc
         except Exception as exc:
             logger.warning("Failed to initialize FlairMemoryService: %s", exc)
 
