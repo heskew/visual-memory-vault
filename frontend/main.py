@@ -1,5 +1,6 @@
 """FastAPI proxy with API Key Authentication, Private GCS Image Persistence & Secure Authenticated Image Serving."""
 
+import io
 import os
 import uuid
 from typing import Annotated
@@ -30,6 +31,14 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from google.cloud import storage
 from google.protobuf.json_format import ParseDict
+from PIL import Image
+
+try:
+    import pillow_heif
+
+    pillow_heif.register_heif_opener()
+except ImportError:
+    pass
 
 RESOURCE = os.environ.get("AGENT_ENGINE_RESOURCE_NAME")
 AGENT_DIRECTORY = os.environ.get("AGENT_DIRECTORY", "app")
@@ -181,17 +190,6 @@ async def chat(req: Request):
     if not parts:
         parts = [{"kind": "text", "text": "(The agent didn't return a reply.)"}]
     return JSONResponse({"parts": parts})
-
-
-import io
-from PIL import Image
-
-try:
-    import pillow_heif
-
-    pillow_heif.register_heif_opener()
-except ImportError:
-    pass
 
 
 def normalize_image(
