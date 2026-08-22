@@ -1,5 +1,6 @@
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 from google.adk.memory.base_memory_service import SearchMemoryResponse
 from google.adk.memory.memory_entry import MemoryEntry
 from google.genai import types
@@ -8,12 +9,13 @@ from app import tools
 from app.app_utils import services
 
 
-def test_store_visual_memory_success():
+@pytest.mark.asyncio
+async def test_store_visual_memory_success():
     mock_service = MagicMock()
     mock_service._request = AsyncMock(return_value={"id": "1", "written": True})
 
     with patch.object(services, "get_memory_service", return_value=mock_service):
-        res = tools.store_visual_memory(
+        res = await tools.store_visual_memory(
             subject="Receipt",
             description="Coffee $5.00",
             tags=["cafe"],
@@ -24,7 +26,8 @@ def test_store_visual_memory_success():
         assert "id" in res
 
 
-def test_search_visual_memories_success():
+@pytest.mark.asyncio
+async def test_search_visual_memories_success():
     mock_service = MagicMock()
     mock_entry = MemoryEntry(
         id="mem-1",
@@ -38,19 +41,20 @@ def test_search_visual_memories_success():
     )
 
     with patch.object(services, "get_memory_service", return_value=mock_service):
-        res = tools.search_visual_memories("Wifi")
+        res = await tools.search_visual_memories("Wifi")
         assert res["status"] == "success"
         assert len(res["results"]) == 1
         assert res["results"][0]["id"] == "mem-1"
         assert "Password: 123" in res["results"][0]["content"]
 
 
-def test_list_visual_memories_success():
+@pytest.mark.asyncio
+async def test_list_visual_memories_success():
     mock_service = MagicMock()
     mock_service._request = AsyncMock(return_value=[{"id": "1", "subject": "Test"}])
 
     with patch.object(services, "get_memory_service", return_value=mock_service):
-        res = tools.list_visual_memories()
+        res = await tools.list_visual_memories()
         assert res["status"] == "success"
         assert len(res["memories"]) == 1
         assert res["memories"][0]["id"] == "1"

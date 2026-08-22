@@ -1,5 +1,3 @@
-import asyncio
-import concurrent.futures
 import uuid
 from typing import Any
 
@@ -9,18 +7,7 @@ from google.genai import types
 from app.app_utils import services
 
 
-def _run_async(coro):
-    """Safely execute an async coroutine from synchronous tool functions."""
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        return asyncio.run(coro)
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-        return executor.submit(asyncio.run, coro).result()
-
-
-def store_visual_memory(
+async def store_visual_memory(
     subject: str,
     description: str,
     tags: list[str] | None = None,
@@ -51,9 +38,7 @@ def store_visual_memory(
                 "visibility": "shared",
                 "tags": tags or ["adk:visual-memory-vault:user"],
             }
-            res = _run_async(
-                mem_service._request("PUT", f"/Memory/{mem_id}", json_body=body)
-            )
+            res = await mem_service._request("PUT", f"/Memory/{mem_id}", json_body=body)
             return {
                 "status": "success",
                 "id": mem_id,
@@ -69,14 +54,12 @@ def store_visual_memory(
                 id=mem_id,
                 content=types.Content(role="model", parts=[types.Part(text=content)]),
             )
-            _run_async(
-                mem_service.add_memory(
-                    app_name="visual-memory-vault",
-                    user_id="user",
-                    memories=[entry],
-                    durability="persistent",
-                    visibility="shared",
-                )
+            await mem_service.add_memory(
+                app_name="visual-memory-vault",
+                user_id="user",
+                memories=[entry],
+                durability="persistent",
+                visibility="shared",
             )
             return {"status": "success", "id": mem_id, "subject": subject}
         except Exception as exc:
@@ -88,7 +71,7 @@ def store_visual_memory(
     }
 
 
-def search_visual_memories(query: str, limit: int = 5) -> dict[str, Any]:
+async def search_visual_memories(query: str, limit: int = 5) -> dict[str, Any]:
     """Search stored visual memories and screenshot facts using semantic search via Flair.
 
     Args:
@@ -98,12 +81,10 @@ def search_visual_memories(query: str, limit: int = 5) -> dict[str, Any]:
     mem_service = services.get_memory_service()
     if hasattr(mem_service, "search_memory"):
         try:
-            res = _run_async(
-                mem_service.search_memory(
-                    app_name="visual-memory-vault",
-                    user_id="user",
-                    query=query,
-                )
+            res = await mem_service.search_memory(
+                app_name="visual-memory-vault",
+                user_id="user",
+                query=query,
             )
             memories = []
             for m in res.memories[:limit]:
@@ -118,24 +99,22 @@ def search_visual_memories(query: str, limit: int = 5) -> dict[str, Any]:
     return {"status": "error", "message": "Memory service does not support search"}
 
 
-def list_visual_memories() -> dict[str, Any]:
+async def list_visual_memories() -> dict[str, Any]:
     """List all stored visual memories in the Flair memory bank."""
     mem_service = services.get_memory_service()
     if hasattr(mem_service, "_request"):
         try:
-            records = _run_async(mem_service._request("GET", "/Memory/"))
+            records = await mem_service._request("GET", "/Memory/")
             return {"status": "success", "memories": records}
         except Exception as exc:
             return {"status": "error", "message": str(exc)}
 
     if hasattr(mem_service, "search_memory"):
         try:
-            res = _run_async(
-                mem_service.search_memory(
-                    app_name="visual-memory-vault",
-                    user_id="user",
-                    query="*",
-                )
+            res = await mem_service.search_memory(
+                app_name="visual-memory-vault",
+                user_id="user",
+                query="*",
             )
             return {
                 "status": "success",
