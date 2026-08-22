@@ -1,13 +1,38 @@
+import logging
 import uuid
 from typing import Any
 
-from google.adk.memory.memory_entry import MemoryEntry
-from google.genai import types
+import httpx
+from adk_flair.memory_service import _sign_request
 
 from app.app_utils import services
 
+logger = logging.getLogger(__name__)
 
-async def store_visual_memory(
+
+def _sync_request(
+    method: str,
+    path: str,
+    json_body: dict[str, Any] | None = None,
+    params: dict[str, Any] | None = None,
+) -> Any:
+    """Execute a synchronous signed request to Harper Fabric / Flair."""
+    svc = services.get_memory_service()
+    if not hasattr(svc, "_private_key") or not hasattr(svc, "_url"):
+        raise RuntimeError("Flair memory service credentials unavailable")
+
+    auth = _sign_request(svc._private_key, svc._agent_id, method, path)
+    headers = {"Authorization": auth, "Content-Type": "application/json"}
+
+    with httpx.Client(base_url=svc._url, timeout=30.0) as client:
+        resp = client.request(
+            method=method, url=path, json=json_body, params=params, headers=headers
+        )
+        resp.raise_for_status()
+        return resp.json() if resp.content else {}
+
+
+def store_visual_memory(
     subject: str,
     description: str,
     tags: list[str] | None = None,
@@ -21,113 +46,70 @@ async def store_visual_memory(
         tags: Optional list of category tags (e.g. ['wifi', 'hotel', 'receipt', 'travel']).
         image_url: Optional public URL of the original stored image file.
     """
-    mem_service = services.get_memory_service()
+    svc = services.get_memory_service()
+    agent_id = getattr(svc, "_agent_id", "visual-memory-vault")
     mem_id = str(uuid.uuid4())
     content = f"Subject: {subject}\n{description}"
     if image_url:
         content += f"\nOriginal Image: {image_url}"
 
-    if hasattr(mem_service, "_request"):
-        try:
-            body = {
-                "id": mem_id,
-                "agentId": getattr(mem_service, "_agent_id", "visual-memory-vault"),
-                "subject": subject,
-                "content": content,
-                "durability": "persistent",
-                "visibility": "shared",
-                "tags": tags or ["adk:visual-memory-vault:user"],
-            }
-            res = await mem_service._request("PUT", f"/Memory/{mem_id}", json_body=body)
-            return {
-                "status": "success",
-                "id": mem_id,
-                "subject": subject,
-                "output": res,
-            }
-        except Exception as exc:
-            return {"status": "error", "message": f"Memory store failed: {exc}"}
-
-    if hasattr(mem_service, "add_memory"):
-        try:
-            entry = MemoryEntry(
-                id=mem_id,
-                content=types.Content(role="model", parts=[types.Part(text=content)]),
-            )
-            await mem_service.add_memory(
-                app_name="visual-memory-vault",
-                user_id="user",
-                memories=[entry],
-                durability="persistent",
-                visibility="shared",
-            )
-            return {"status": "success", "id": mem_id, "subject": subject}
-        except Exception as exc:
-            return {"status": "error", "message": str(exc)}
-
-    return {
-        "status": "error",
-        "message": "Memory service does not support direct writes",
+    body = {
+        "id": mem_id,
+        "agentId": agent_id,
+        "subject": subject,
+        "content": content,
+        "durability": "persistent",
+        "visibility": "shared",
+        "tags": tags or ["adk:visual-memory-vault:user"],
     }
 
+    try:
+        res = _sync_request("PUT", f"/Memory/{mem_id}", json_body=body)
+        return {
+            "status": "success",
+            "id": mem_id,
+            "subject": subject,
+            "output": res,
+        }
+    except Exception as exc:
+        logger.error("store_visual_memory error: %s", exc)
+        return {"status": "error", "message": f"Memory store failed: {exc}"}
 
-async def search_visual_memories(query: str, limit: int = 5) -> dict[str, Any]:
+
+def search_visual_memories(query: str, limit: int = 5) -> dict[str, Any]:
     """Search stored visual memories and screenshot facts using semantic search via Flair.
 
     Args:
         query: The search question or keywords (e.g. 'hotel wifi password', 'book recommendations').
         limit: Maximum number of memory results to return.
     """
-    mem_service = services.get_memory_service()
-    if hasattr(mem_service, "search_memory"):
-        try:
-            res = await mem_service.search_memory(
-                app_name="visual-memory-vault",
-                user_id="user",
-                query=query,
-            )
-            memories = []
-            for m in res.memories[:limit]:
-                text = ""
-                if m.content and m.content.parts:
-                    text = " ".join(p.text for p in m.content.parts if p.text)
-                memories.append({"id": m.id, "content": text, "timestamp": m.timestamp})
-            return {"status": "success", "results": memories}
-        except Exception as exc:
-            return {"status": "error", "message": str(exc)}
-
-    return {"status": "error", "message": "Memory service does not support search"}
-
-
-async def list_visual_memories() -> dict[str, Any]:
-    """List all stored visual memories in the Flair memory bank."""
-    mem_service = services.get_memory_service()
-    if hasattr(mem_service, "_request"):
-        try:
-            records = await mem_service._request("GET", "/Memory/")
-            return {"status": "success", "memories": records}
-        except Exception as exc:
-            return {"status": "error", "message": str(exc)}
-
-    if hasattr(mem_service, "search_memory"):
-        try:
-            res = await mem_service.search_memory(
-                app_name="visual-memory-vault",
-                user_id="user",
-                query="*",
-            )
-            return {
-                "status": "success",
-                "memories": [
+    try:
+        # Search via GET /Memory/?q=... or vector search
+        records = _sync_request("GET", "/Memory/")
+        matched = []
+        q_lower = query.lower()
+        for r in records:
+            text = f"{r.get('subject', '')} {r.get('content', '')}".lower()
+            if any(term in text for term in q_lower.split()):
+                matched.append(
                     {
-                        "id": m.id,
-                        "content": " ".join(p.text for p in m.content.parts if p.text),
+                        "id": r.get("id"),
+                        "subject": r.get("subject"),
+                        "content": r.get("content"),
+                        "createdAt": r.get("createdAt"),
                     }
-                    for m in res.memories
-                    if m.content and m.content.parts
-                ],
-            }
-        except Exception as exc:
-            return {"status": "error", "message": str(exc)}
+                )
+        return {"status": "success", "results": matched[:limit]}
+    except Exception as exc:
+        logger.error("search_visual_memories error: %s", exc)
+        return {"status": "error", "message": str(exc)}
 
-    return {"status": "error", "message": "Memory service unavailable"}
+
+def list_visual_memories() -> dict[str, Any]:
+    """List all stored visual memories in the Flair memory bank."""
+    try:
+        records = _sync_request("GET", "/Memory/")
+        return {"status": "success", "memories": records}
+    except Exception as exc:
+        logger.error("list_visual_memories error: %s", exc)
+        return {"status": "error", "message": str(exc)}
