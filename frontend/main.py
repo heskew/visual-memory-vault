@@ -31,7 +31,9 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from google.cloud import storage
 from google.protobuf.json_format import ParseDict
-from PIL import Image
+from PIL import Image, ImageFile
+
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 try:
     import pillow_heif
