@@ -1,3 +1,7 @@
+import asyncio
+import functools
+from typing import Any
+
 from adk_flair.tools import create_flair_tools
 from google.adk.agents import Agent
 from google.adk.apps import App
@@ -8,11 +12,42 @@ from app.app_utils import services
 
 MODEL = "gemini-3.7-flash"
 
-flair_tools = create_flair_tools(
+_async_store, _async_search, _async_list = create_flair_tools(
     services.get_memory_service(),
     app_name="visual-memory-vault",
     user_id="user",
 )
+
+
+def _run_sync(coro):
+    """Safely run an async tool coroutine from synchronous runner threads."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+
+    import nest_asyncio
+
+    nest_asyncio.apply()
+    return loop.run_until_complete(coro)
+
+
+@functools.wraps(_async_store)
+def store_memory(*args: Any, **kwargs: Any) -> dict:
+    return _run_sync(_async_store(*args, **kwargs))
+
+
+@functools.wraps(_async_search)
+def search_memory(*args: Any, **kwargs: Any) -> dict:
+    return _run_sync(_async_search(*args, **kwargs))
+
+
+@functools.wraps(_async_list)
+def list_memories(*args: Any, **kwargs: Any) -> dict:
+    return _run_sync(_async_list(*args, **kwargs))
+
+
+flair_tools = [store_memory, search_memory, list_memories]
 
 root_agent = Agent(
     name="root_agent",
