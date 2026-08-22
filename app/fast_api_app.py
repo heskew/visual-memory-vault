@@ -35,9 +35,15 @@ load_dotenv()
 otel_to_cloud = os.environ.get(
     "GOOGLE_CLOUD_AGENT_ENGINE_ENABLE_TELEMETRY", ""
 ).lower() in ("true", "1")
-_, project_id = google.auth.default()
-logging_client = google_cloud_logging.Client()
-logger = logging_client.logger(__name__)
+
+try:
+    _, project_id = google.auth.default()
+    logging_client = google_cloud_logging.Client()
+    logger = logging_client.logger(__name__)
+except Exception:
+    import logging
+    logger = logging.getLogger(__name__)
+
 allow_origins = (
     os.getenv("ALLOW_ORIGINS", "").split(",") if os.getenv("ALLOW_ORIGINS") else None
 )

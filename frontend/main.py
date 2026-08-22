@@ -31,22 +31,26 @@ from fastapi.staticfiles import StaticFiles
 from google.cloud import storage
 from google.protobuf.json_format import ParseDict
 
-RESOURCE = os.environ.get(
-    "AGENT_ENGINE_RESOURCE_NAME",
-    "projects/621065712696/locations/us-east1/reasoningEngines/1086440633544998912",
-)
+RESOURCE = os.environ.get("AGENT_ENGINE_RESOURCE_NAME")
 AGENT_DIRECTORY = os.environ.get("AGENT_DIRECTORY", "app")
-LOCATION = (
-    RESOURCE.split("/locations/")[1].split("/")[0]
-    if "/locations/" in RESOURCE
-    else "us-east1"
-)
-GCS_BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME", "bwg3-qwiklabs-gcp-04-4fe84a121fc3")
+GCS_BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME")
+MEDIA_DIR = os.path.abspath(os.environ.get("MEDIA_DIR", "./media"))
 
-A2A_BASE = (
-    f"https://{LOCATION}-aiplatform.googleapis.com/reasoningEngines/v1/"
-    f"{RESOURCE}/api/a2a/{AGENT_DIRECTORY}"
-)
+if "A2A_BASE_URL" in os.environ:
+    A2A_BASE = os.environ["A2A_BASE_URL"]
+elif RESOURCE:
+    LOCATION = (
+        RESOURCE.split("/locations/")[1].split("/")[0]
+        if "/locations/" in RESOURCE
+        else "us-east1"
+    )
+    A2A_BASE = (
+        f"https://{LOCATION}-aiplatform.googleapis.com/reasoningEngines/v1/"
+        f"{RESOURCE}/api/a2a/{AGENT_DIRECTORY}"
+    )
+else:
+    A2A_BASE = f"http://127.0.0.1:{os.environ.get('BACKEND_PORT', '8000')}/a2a/{AGENT_DIRECTORY}"
+
 A2A_CARD_URL = f"{A2A_BASE}/.well-known/agent-card.json"
 
 _A2UI_MIME = "application/json+a2ui"
@@ -191,28 +195,37 @@ async def upload_image(
     file_bytes = await file.read()
     filename = file.filename or "uploaded_photo.jpg"
 
-    # 1. Save original photo privately to GCS
+    # 1. Save original photo (local disk + optional GCS)
     image_name = f"{uuid.uuid4()}_{filename}"
     blob_id = f"vault-images/{image_name}"
-    protected_url = None
+    protected_url = f"/media/{image_name}"
 
     try:
-        gcs = _get_gcs_client()
-        bucket = gcs.bucket(GCS_BUCKET_NAME)
-        blob = bucket.blob(blob_id)
-        blob.upload_from_string(
-            file_bytes, content_type=file.content_type or "image/jpeg"
-        )
-        protected_url = f"/media/{image_name}"
+        os.makedirs(MEDIA_DIR, exist_ok=True)
+        local_path = os.path.join(MEDIA_DIR, image_name)
+        with open(local_path, "wb") as f:
+            f.write(file_bytes)
     except Exception as e:
-        print(f"Warning: Failed to upload image to GCS: {e}")
+        print(f"Warning: Failed to save image locally: {e}")
+
+    if GCS_BUCKET_NAME:
+        try:
+            gcs = _get_gcs_client()
+            if gcs:
+                bucket = gcs.bucket(GCS_BUCKET_NAME)
+                blob = bucket.blob(blob_id)
+                blob.upload_from_string(
+                    file_bytes, content_type=file.content_type or "image/jpeg"
+                )
+        except Exception as e:
+            print(f"Warning: Failed to upload image to GCS: {e}")
 
     # 2. Build prompt for agent with authenticated proxy URL & image bytes
     prompt = (
         f"I uploaded a photo/screenshot named '{filename}'. "
         f"Protected Media Relative Path: {protected_url or 'N/A'}. "
         f"Subject context: {subject or 'Mobile upload'}. "
-        "Extract key text, details, and context from this image and store it into my FLAIR visual memory. "
+        "Extract key text, details, and context from this image and store it into my Flair visual memory. "
         f"Pass image_url='{protected_url}' when storing the memory."
     )
 
@@ -269,20 +282,30 @@ async def get_media(
 ):
     """Authenticated image retrieval endpoint requiring API Key verification."""
     verify_api_key(req, x_api_key)
-    try:
-        gcs = _get_gcs_client()
-        bucket = gcs.bucket(GCS_BUCKET_NAME)
-        blob = bucket.blob(f"vault-images/{image_name}")
-        if not blob.exists():
-            raise HTTPException(status_code=404, detail="Image not found")
-        content = blob.download_as_bytes()
-        return Response(content=content, media_type=blob.content_type or "image/jpeg")
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(
-            status_code=500, detail=f"Failed to retrieve image: {e}"
-        ) from e
+
+    # 1. Check local media directory first
+    local_path = os.path.join(MEDIA_DIR, image_name)
+    if os.path.exists(local_path):
+        with open(local_path, "rb") as f:
+            content = f.read()
+        return Response(content=content, media_type="image/jpeg")
+
+    # 2. Check GCS bucket if configured
+    if GCS_BUCKET_NAME:
+        try:
+            gcs = _get_gcs_client()
+            if gcs:
+                bucket = gcs.bucket(GCS_BUCKET_NAME)
+                blob = bucket.blob(f"vault-images/{image_name}")
+                if blob.exists():
+                    content = blob.download_as_bytes()
+                    return Response(
+                        content=content, media_type=blob.content_type or "image/jpeg"
+                    )
+        except Exception as e:
+            print(f"Warning: GCS image fetch failed: {e}")
+
+    raise HTTPException(status_code=404, detail="Image not found")
 
 
 static_dir = "static" if os.path.exists("static") else "frontend/static"

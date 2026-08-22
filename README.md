@@ -1,14 +1,14 @@
 # Visual Memory Vault
 
-> **Google ADK + Harper FLAIR: Sovereign, Multimodal Agent Memory**
+> **Google ADK + Flair + Harper: Sovereign, Multimodal Agent Memory**
 
 **Visual Memory Vault** is a multimodal AI agent that captures, indexes, and semantically recalls information from photos, receipts, documents, and screenshots. 
 
-Built with **[Google Agent Development Kit (ADK)](https://github.com/google/adk)**, **[Gemini 3.7 Flash](https://deepmind.google/technologies/gemini/)**, and **[Harper FLAIR](https://github.com/tpsdev-ai/flair)** via the official [`adk-flair`](https://pypi.org/project/adk-flair/) package.
+Built with **[Google Agent Development Kit (ADK)](https://github.com/google/adk)**, **[Gemini 3.7 Flash](https://deepmind.google/technologies/gemini/)**, and **[Flair](https://github.com/tpsdev-ai/flair)** (powered by [Harper](https://harper.fast)) via the official [`adk-flair`](https://pypi.org/project/adk-flair/) package.
 
 ---
 
-## 💡 The Trinity: Google ADK + Harper + FLAIR
+## 💡 The Trinity: Google ADK + Harper + Flair
 
 ### 1. Google ADK (Agent Development Kit) & Gemini 3.7
 Google ADK provides the modular, production-ready runtime for agentic workflows:
@@ -22,15 +22,15 @@ Harper provides the underlying enterprise data fabric powering low-latency distr
 - **Edge to Cloud Fabric**: Run locally during development or deploy across global edge clusters via [Harper Fabric](https://harperdb.io) with automatic synchronization.
 - **Zero Database Sprawl**: Eliminates the need for separate caching layers, message buses, and vector databases.
 
-### 3. FLAIR: The Open Agent Memory Standard
-FLAIR brings sovereign, persistent, and federated memory to the agent ecosystem:
+### 3. Flair: The Open Agent Memory Standard
+Flair brings sovereign, persistent, and federated memory to the agent ecosystem:
 - **Cryptographic Identity**: Every agent identity is backed by Ed25519 keypairs. Every memory write is cryptographically signed and verifiable.
-- **Continuous Knowledge Consolidation**: FLAIR’s memory engine autonomously consolidates, deduplicates, and connects facts across conversations.
+- **Continuous Knowledge Consolidation**: Flair’s memory engine autonomously consolidates, deduplicates, and connects facts across conversations.
 - **Native Semantic Search**: Vector similarity and graph relationships baked directly into the memory layer.
 - **Seamless ADK Integration**: First-class Python integration via the official [`adk-flair`](https://pypi.org/project/adk-flair/) package.
 
 ### 🤝 The Winning Synergy
-**Google ADK** powers world-class multimodal reasoning. **Harper** powers high-throughput distributed data fabric. **FLAIR** ensures your agent's memory remains sovereign, cryptographically secure, and permanent.
+**Google ADK** powers world-class multimodal reasoning. **Harper** powers high-throughput distributed data fabric. **Flair** ensures your agent's memory remains sovereign, cryptographically secure, and permanent.
 
 ---
 
@@ -50,9 +50,9 @@ flowchart TD
         Tools["Vault Tools (store, search, list)"]
     end
 
-    subgraph Harper["Harper / FLAIR Memory Layer"]
+    subgraph Harper["Harper / Flair Memory Layer"]
         Adapter["adk-flair (Ed25519 Signed REST / CLI)"]
-        Daemon["Harper Fabric / FLAIR Daemon"]
+        Daemon["Harper Fabric / Flair Daemon"]
         Vector["Semantic Index & Graph Recall"]
     end
 
@@ -87,7 +87,7 @@ flowchart TD
   mise use python@3.12 uv@latest
   # or: curl -LsSf https://astral.sh/uv/install.sh | sh
   ```
-- **FLAIR**:
+- **Flair**:
   ```bash
   npm i -g @tpsdev-ai/flair
   flair init
@@ -180,7 +180,7 @@ tests/integration/test_flair_vault.py::test_flair_vault_end_to_end PASSED
 | :--- | :--- | :--- |
 | **Agent Framework** | [Google ADK](https://github.com/google/adk) | Agent orchestration, tools loop, sessions, and A2A protocol |
 | **Multimodal LLM** | [Gemini 3.7 Flash](https://ai.google.dev/) | High-speed multimodal OCR, visual parsing, and reasoning |
-| **Memory Engine** | [Harper FLAIR](https://github.com/tpsdev-ai/flair) | Decentralized, Ed25519-signed long-term semantic memory |
+| **Memory Engine** | [Flair](https://github.com/tpsdev-ai/flair) (on Harper) | Decentralized, Ed25519-signed long-term semantic memory |
 | **ADK Adapter** | [`adk-flair`](https://pypi.org/project/adk-flair/) | Official ADK `BaseMemoryService` integration for Flair |
 | **Backend API** | [FastAPI](https://fastapi.tiangolo.com/) | REST, SSE, and A2A JSON-RPC transport |
 | **Package Manager** | [Astral uv](https://docs.astral.sh/uv/) | Blazing fast Python environment & dependency management |

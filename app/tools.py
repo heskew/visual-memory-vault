@@ -9,7 +9,7 @@ def store_visual_memory(
     tags: list[str] | None = None,
     image_url: str | None = None,
 ) -> dict[str, Any]:
-    """Store a photo, screenshot, or visual information into the agent's FLAIR memory bank.
+    """Store a photo, screenshot, or visual information into the agent's Flair memory bank.
 
     Args:
         subject: One-line title or main topic of the photo/screenshot (e.g. 'Hotel WiFi Keycard', 'Lunch Receipt').
@@ -24,7 +24,7 @@ def store_visual_memory(
 
 
 def search_visual_memories(query: str, limit: int = 5) -> dict[str, Any]:
-    """Search stored visual memories and screenshot facts using semantic search via FLAIR.
+    """Search stored visual memories and screenshot facts using semantic search via Flair.
 
     Args:
         query: The search question or keywords (e.g. 'hotel wifi password', 'book recommendations').
@@ -34,5 +34,5 @@ def search_visual_memories(query: str, limit: int = 5) -> dict[str, Any]:
 
 
 def list_visual_memories() -> dict[str, Any]:
-    """List all stored visual memories in the FLAIR memory bank."""
+    """List all stored visual memories in the Flair memory bank."""
     return list_memories()

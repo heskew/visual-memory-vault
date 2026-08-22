@@ -106,7 +106,7 @@ def _sign_header(
         sig = base64.b64encode(priv_key.sign(payload)).decode("utf-8")
         return effective_agent, f"TPS-Ed25519 {effective_agent}:{ts}:{nonce}:{sig}"
     except Exception as e:
-        logger.warning("Failed to sign FLAIR request: %s", e)
+        logger.warning("Failed to sign Flair request: %s", e)
         return None
 
 
@@ -117,7 +117,7 @@ def store_memory(
     durability: str = "persistent",
     visibility: str | None = None,
 ) -> dict[str, Any]:
-    """Store a memory row in FLAIR for the agent."""
+    """Store a memory row in Flair for the agent."""
     mem_id = str(uuid.uuid4())
     path = f"/Memory/{mem_id}"
     target = get_flair_target()
@@ -191,16 +191,16 @@ def store_memory(
                 "subject": subject,
             }
         except Exception as err:
-            return {"status": "error", "message": f"FLAIR CLI store failed: {err}"}
+            return {"status": "error", "message": f"Flair CLI store failed: {err}"}
 
     return {
         "status": "error",
-        "message": "No valid FLAIR authentication key or CLI available",
+        "message": "No valid Flair authentication key or CLI available",
     }
 
 
 def search_memories(query: str, limit: int = 5) -> dict[str, Any]:
-    """Search FLAIR memory using semantic search."""
+    """Search Flair memory using semantic search."""
     path = "/SemanticSearch"
     target = get_flair_target()
     sign_result = _sign_header("POST", path)
@@ -246,16 +246,16 @@ def search_memories(query: str, limit: int = 5) -> dict[str, Any]:
                 }
             return {"status": "success", "results": res.stdout.strip()}
         except Exception as err:
-            return {"status": "error", "message": f"FLAIR CLI search failed: {err}"}
+            return {"status": "error", "message": f"Flair CLI search failed: {err}"}
 
     return {
         "status": "error",
-        "message": "No valid FLAIR authentication key or CLI available",
+        "message": "No valid Flair authentication key or CLI available",
     }
 
 
 def list_memories(limit: int = 20) -> dict[str, Any]:
-    """List stored memories in FLAIR."""
+    """List stored memories in Flair."""
     path = "/Memory"
     target = get_flair_target()
     sign_result = _sign_header("GET", path)
@@ -290,9 +290,9 @@ def list_memories(limit: int = 20) -> dict[str, Any]:
                 }
             return {"status": "success", "memories": res.stdout.strip()}
         except Exception as err:
-            return {"status": "error", "message": f"FLAIR CLI list failed: {err}"}
+            return {"status": "error", "message": f"Flair CLI list failed: {err}"}
 
     return {
         "status": "error",
-        "message": "No valid FLAIR authentication key or CLI available",
+        "message": "No valid Flair authentication key or CLI available",
     }

@@ -1,7 +1,7 @@
 [project]
 name = "visual-memory-vault"
 version = "0.1.0"
-description = "Multimodal AI visual memory vault powered by Google ADK, Gemini 3.7 Flash, and Harper FLAIR."
+description = "Multimodal AI visual memory vault powered by Google ADK, Gemini 3.7 Flash, and Flair on Harper."
 readme = "README.md"
 license = { text = "Apache-2.0" }
 authors = [
@@ -97,6 +97,7 @@ build-backend = "hatchling.build"
 [tool.pytest.ini_options]
 pythonpath = "."
 asyncio_default_fixture_loop_scope = "session"
+addopts = "-ra -q --import-mode=importlib"
 
 [tool.hatch.build.targets.wheel]
 packages = ["app","frontend"]
