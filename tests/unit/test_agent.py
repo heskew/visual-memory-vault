@@ -12,6 +12,14 @@ def test_agent_configuration():
     assert "list_memories" in tool_names
 
 
+def test_agent_instruction_requires_receipt_custom_metadata():
+    instruction = root_agent.instruction
+    assert "merchant" in instruction
+    assert "amount" in instruction
+    assert "date" in instruction
+    assert "custom_metadata" in instruction
+
+
 def test_app_structure():
     assert app.name == "app"
     assert app.root_agent is root_agent

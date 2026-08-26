@@ -1,8 +1,15 @@
+from pathlib import Path
+
 import pytest
 from fastapi import HTTPException
 from starlette.requests import Request
 
-from frontend.main import _extract_parts, verify_api_key
+from frontend.main import (
+    _extract_parts,
+    extract_receipt_fields,
+    strip_receipt_marker,
+    verify_api_key,
+)
 
 
 def test_verify_api_key_when_no_key_configured(monkeypatch):
@@ -38,3 +45,36 @@ def test_extract_parts():
     extracted = _extract_parts(parts)
     assert len(extracted) == 2
     assert extracted[0] == {"kind": "text", "text": "Hello world"}
+
+
+def test_extract_receipt_fields_from_marker_line():
+    text = (
+        "Saved dinner at Joe's Grill.\n"
+        'RECEIPT: {"merchant":"Joe\'s Grill","amount":"58.40","currency":"USD","date":"2026-08-20"}'
+    )
+    fields = extract_receipt_fields(text)
+    assert fields["merchant"] == "Joe's Grill"
+    assert fields["amount"] == "58.40"
+    assert fields["currency"] == "USD"
+    assert fields["date"] == "2026-08-20"
+    assert "RECEIPT:" not in strip_receipt_marker(text)
+    assert "Saved dinner at Joe's Grill." in strip_receipt_marker(text)
+
+
+def test_extract_receipt_fields_empty_when_not_a_receipt():
+    fields = extract_receipt_fields("Saved hotel WiFi card. Network: Guest.")
+    assert fields == {
+        "merchant": None,
+        "amount": None,
+        "currency": None,
+        "date": None,
+    }
+
+
+def test_index_html_has_three_row_receipt_chip():
+    html = Path("frontend/static/index.html").read_text()
+    assert "receipt-chip" in html
+    assert "receipt-row merchant" in html
+    assert "receipt-row amount" in html
+    assert "receipt-row date" in html
+    assert "function receiptChip" in html

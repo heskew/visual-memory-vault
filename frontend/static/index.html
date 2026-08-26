@@ -41,6 +41,11 @@
   .a2divider { border:none; border-top:1px solid var(--border); margin:.4rem 0; width:100%; }
   .a2img { max-width:100%; border-radius:8px; display:block; }
   .material-symbols-outlined { font-family:'Material Symbols Outlined'; font-size:1.25rem; line-height:1; vertical-align:middle; color:var(--accent); }
+  .receipt-chip { display:flex; flex-direction:column; gap:.15rem; margin:0 0 .55rem; padding:.55rem .75rem; border:1px solid var(--border); border-radius:10px; background:#eef4fd; max-width:16rem; }
+  .receipt-row { line-height:1.35; }
+  .receipt-row.merchant { font-weight:700; }
+  .receipt-row.amount { font-variant-numeric:tabular-nums; }
+  .receipt-row.date { font-size:.85rem; color:#5f6368; }
 </style>
 </head>
 <body>
@@ -175,6 +180,16 @@ function flattenText(messages) {
   return out.join("\n").trim();
 }
 
+function receiptChip(data) {
+  if (!data || !(data.merchant || data.amount || data.date)) return null;
+  const chip = el("div", "receipt-chip");
+  chip.appendChild(el("div", "receipt-row merchant", data.merchant || "—"));
+  const amount = [data.amount, data.currency].filter(Boolean).join(" ");
+  chip.appendChild(el("div", "receipt-row amount", amount || "—"));
+  chip.appendChild(el("div", "receipt-row date", data.date || "—"));
+  return chip;
+}
+
 function renderReply(b, parts) {
   b.textContent = "";   // clear the "…" placeholder
   const texts = parts.filter(p => p && (p.kind === "text" || (!p.kind && p.text))).map(p => p.text || "");
@@ -212,7 +227,10 @@ fileInput.addEventListener("change", async () => {
     let data;
     try { data = JSON.parse(raw); }
     catch { throw new Error(`Server returned non-JSON (HTTP ${res.status}). ${raw.slice(0, 300)}`); }
-    b.textContent = data.reply || data.summary || "Photo saved to Visual Memory!";
+    b.textContent = "";
+    const chip = receiptChip(data);
+    if (chip) b.appendChild(chip);
+    b.appendChild(el("div", null, data.reply || data.summary || "Photo saved to Visual Memory!"));
   } catch (e) {
     b.textContent = "Upload Error: " + e.message;
   } finally {
