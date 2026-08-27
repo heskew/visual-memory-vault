@@ -61,6 +61,21 @@ def test_extract_receipt_fields_from_marker_line():
     assert "Saved dinner at Joe's Grill." in strip_receipt_marker(text)
 
 
+def test_extract_and_strip_receipt_marker_with_trailing_period():
+    text = (
+        "Saved dinner at Joe's Grill.\n"
+        'RECEIPT: {"merchant":"Joe\'s Grill","amount":"58.40","currency":"USD","date":"2026-08-20"}.'
+    )
+    fields = extract_receipt_fields(text)
+    assert fields["merchant"] == "Joe's Grill"
+    assert fields["amount"] == "58.40"
+    assert fields["currency"] == "USD"
+    assert fields["date"] == "2026-08-20"
+    stripped = strip_receipt_marker(text)
+    assert "RECEIPT:" not in stripped
+    assert "Saved dinner at Joe's Grill." in stripped
+
+
 def test_extract_receipt_fields_empty_when_not_a_receipt():
     fields = extract_receipt_fields("Saved hotel WiFi card. Network: Guest.")
     assert fields == {

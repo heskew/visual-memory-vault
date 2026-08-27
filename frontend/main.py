@@ -68,7 +68,9 @@ A2A_CARD_URL = f"{A2A_BASE}/.well-known/agent-card.json"
 
 _A2UI_MIME = "application/json+a2ui"
 API_KEY = os.environ.get("PROXY_API_KEY", "")
-_RECEIPT_LINE_RE = re.compile(r"RECEIPT:\s*(\{.*?\})\s*$", re.MULTILINE | re.DOTALL)
+_RECEIPT_LINE_RE = re.compile(
+    r"RECEIPT:\s*(\{.*?\})\s*[^\n]*$", re.MULTILINE | re.DOTALL
+)
 _RECEIPT_FIELD_KEYS = ("merchant", "amount", "currency", "date")
 
 
@@ -304,7 +306,7 @@ async def upload_image(
         f"Pass image_url='{protected_url}' when storing the memory. "
         "If this image is a receipt or invoice, extract merchant, amount, currency, and date, "
         "pass them in store_memory custom_metadata together with image_url, keep the prose description, "
-        'and include one reply line: RECEIPT: {"merchant":"...","amount":"...","currency":"...","date":"..."}.'
+        'and include one reply line of the form RECEIPT: {"merchant":"...","amount":"...","currency":"...","date":"..."}'
     )
 
     async with httpx.AsyncClient(headers=_auth_headers(), timeout=120) as client:
