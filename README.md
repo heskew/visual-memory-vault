@@ -4,11 +4,7 @@
 
 **Visual Memory Vault** is a multimodal AI agent that captures, indexes, and semantically recalls information from photos, receipts, documents, and screenshots.
 
-**Origin:** Started at [Build with Gemini Bellevue](https://cloud.google.com/events/build-with-gemini-seattle-2), Thursday Aug 20 2026. This repository was created that evening (`created_at` 2026-08-21T00:52:39Z).
-
 Built with **[Google Agent Development Kit (ADK)](https://github.com/google/adk)**, **[Gemini 3.7 Flash](https://deepmind.google/technologies/gemini/)**, and **[Flair](https://github.com/tpsdev-ai/flair)** (powered by [Harper](https://harper.fast)) via the official [`adk-flair`](https://pypi.org/project/adk-flair/) package.
-
-**Disclose:** This repository is the All Things Agentic contest project. It is not a submission of Flair the product. It uses two pre-existing libraries: [Flair](https://github.com/tpsdev-ai/flair) and [`adk-flair>=0.48.0`](https://pypi.org/project/adk-flair/). Listing by **TPS Dev AI**.
 
 ---
 
@@ -197,6 +193,6 @@ tests/integration/test_flair_vault.py::test_flair_vault_end_to_end PASSED
 
 ## 📄 License
 
-Apache 2.0. Created for All Things Agentic Hackathon. Built with the Build with Gemini ecosystem.
+Apache 2.0. Built with the Build with Gemini ecosystem.
 
 
