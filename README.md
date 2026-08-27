@@ -193,6 +193,6 @@ tests/integration/test_flair_vault.py::test_flair_vault_end_to_end PASSED
 
 ## 📄 License
 
-Apache 2.0. Built with the Build with Gemini ecosystem.
+Apache 2.0.
 
 
