@@ -2,6 +2,7 @@ import asyncio
 import functools
 from typing import Any
 
+from adk_flair import FlairMemoryService
 from adk_flair.tools import create_flair_tools
 from google.adk.agents import Agent
 from google.adk.apps import App
@@ -12,11 +13,28 @@ from app.app_utils import services
 
 MODEL = "gemini-3.7-flash"
 
-_async_store, _async_search, _async_list = create_flair_tools(
-    services.get_memory_service(),
-    app_name="visual-memory-vault",
-    user_id="user",
-)
+
+class _SignatureFlair(FlairMemoryService):
+    """Import-time stand-in so create_flair_tools can bind signatures.
+
+    CI and unit collection often have no Flair keyfile, so
+    ``get_memory_service()`` falls back to ``InMemoryMemoryService``.
+    ``create_flair_tools`` rejects that type. Runtime wrappers re-bind
+    against the live service via ``_get_runtime_tools()``.
+    """
+
+    def __init__(self) -> None:
+        pass
+
+
+def _bind_tool_signatures():
+    svc = services.get_memory_service()
+    if not isinstance(svc, FlairMemoryService):
+        svc = _SignatureFlair()
+    return create_flair_tools(svc, app_name="visual-memory-vault", user_id="user")
+
+
+_async_store, _async_search, _async_list = _bind_tool_signatures()
 
 
 def _run_sync(coro):
@@ -75,8 +93,14 @@ root_agent = Agent(
         "details into Flair memory. Do not ask for confirmation before storing.\n"
         "3. Set `subject` to a concise title (e.g. 'Starbucks Receipt - $6.50', 'Hotel WiFi Info'), "
         "set `description` to the detailed extracted facts and text context, and pass "
-        "`custom_metadata={'image_url': '<path>'}` if a media path is provided.\n"
-        "4. In your response to the user, summarize what was saved and highlight key details.\n\n"
+        "`custom_metadata` with at least `image_url` when a media path is provided.\n"
+        "4. If the image is a receipt or invoice, you MUST extract merchant, amount, currency, "
+        "and date, and pass them in `custom_metadata` together with image_url: "
+        "`custom_metadata={'merchant': '...', 'amount': '...', 'currency': 'USD', "
+        "'date': 'YYYY-MM-DD', 'image_url': '<path>'}`. Keep the prose description.\n"
+        "5. In your response to the user, summarize what was saved and highlight key details. "
+        "For receipts, also include one machine-readable line:\n"
+        'RECEIPT: {"merchant":"...","amount":"...","currency":"...","date":"..."}\n\n'
         "When users ask to recall, find, or browse memories, use `search_memory` or `list_memories`."
     ),
     tools=flair_tools,

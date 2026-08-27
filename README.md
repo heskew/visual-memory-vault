@@ -2,7 +2,7 @@
 
 > **Google ADK + Flair + Harper: Sovereign, Multimodal Agent Memory**
 
-**Visual Memory Vault** is a multimodal AI agent that captures, indexes, and semantically recalls information from photos, receipts, documents, and screenshots. 
+**Visual Memory Vault** is a multimodal AI agent that captures, indexes, and semantically recalls information from photos, receipts, documents, and screenshots.
 
 Built with **[Google Agent Development Kit (ADK)](https://github.com/google/adk)**, **[Gemini 3.7 Flash](https://deepmind.google/technologies/gemini/)**, and **[Flair](https://github.com/tpsdev-ai/flair)** (powered by [Harper](https://harper.fast)) via the official [`adk-flair`](https://pypi.org/project/adk-flair/) package.
 
@@ -146,7 +146,11 @@ Response:
 {
   "status": "success",
   "filename": "receipt.jpg",
-  "summary": "Saved receipt from Joe's Grill: Total $58.40 on Aug 20, 2026. Items: Ribeye, sparkling water."
+  "summary": "Saved receipt from Joe's Grill: Total $58.40 on Aug 20, 2026. Items: Ribeye, sparkling water.",
+  "merchant": "Joe's Grill",
+  "amount": "58.40",
+  "currency": "USD",
+  "date": "2026-08-20"
 }
 ```
 
@@ -162,11 +166,11 @@ uv run pytest tests/unit tests/integration/test_flair_vault.py -v
 
 ```
 tests/unit/test_agent.py::test_agent_configuration PASSED
+tests/unit/test_agent.py::test_agent_instruction_requires_receipt_custom_metadata PASSED
 tests/unit/test_agent.py::test_app_structure PASSED
-tests/unit/test_flair_client.py::test_get_flair_agent_id PASSED
-tests/unit/test_flair_client.py::test_store_memory_rest_success PASSED
-tests/unit/test_flair_client.py::test_search_memories_rest_success PASSED
-tests/unit/test_tools.py::test_store_visual_memory_basic PASSED
+tests/unit/test_tools.py::test_store_memory_passes_receipt_custom_metadata PASSED
+tests/unit/test_tools.py::test_search_memory_returns_live_shape PASSED
+tests/unit/test_tools.py::test_list_memories_returns_live_shape PASSED
 tests/unit/test_services.py::test_memory_service PASSED
 tests/integration/test_flair_vault.py::test_flair_vault_end_to_end PASSED
 ======================== 24 passed in 0.85s =========================
@@ -189,6 +193,6 @@ tests/integration/test_flair_vault.py::test_flair_vault_end_to_end PASSED
 
 ## 📄 License
 
-Apache 2.0. Built for the **Build with Gemini** ecosystem.
+Apache 2.0.
 
 

@@ -1,7 +1,9 @@
 """FastAPI proxy with API Key Authentication, Private GCS Image Persistence & Secure Authenticated Image Serving."""
 
 import io
+import json
 import os
+import re
 import uuid
 from typing import Annotated
 
@@ -66,6 +68,49 @@ A2A_CARD_URL = f"{A2A_BASE}/.well-known/agent-card.json"
 
 _A2UI_MIME = "application/json+a2ui"
 API_KEY = os.environ.get("PROXY_API_KEY", "")
+_RECEIPT_LINE_RE = re.compile(
+    r"RECEIPT:\s*(\{.*?\})\s*[^\n]*$", re.MULTILINE | re.DOTALL
+)
+_RECEIPT_FIELD_KEYS = ("merchant", "amount", "currency", "date")
+
+
+def extract_receipt_fields(text: str | None) -> dict[str, str | None]:
+    """Parse merchant/amount/currency/date from an agent receipt reply."""
+    empty = dict.fromkeys(_RECEIPT_FIELD_KEYS)
+    if not text:
+        return empty
+    payload = None
+    match = _RECEIPT_LINE_RE.search(text)
+    if match:
+        try:
+            payload = json.loads(match.group(1))
+        except json.JSONDecodeError:
+            payload = None
+    if payload is None:
+        for candidate in re.finditer(r"\{[^{}]+\}", text):
+            try:
+                obj = json.loads(candidate.group(0))
+            except json.JSONDecodeError:
+                continue
+            if any(key in obj for key in _RECEIPT_FIELD_KEYS):
+                payload = obj
+                break
+    if not isinstance(payload, dict):
+        return empty
+    out = dict(empty)
+    for key in _RECEIPT_FIELD_KEYS:
+        value = payload.get(key)
+        if value not in (None, ""):
+            out[key] = str(value)
+    return out
+
+
+def strip_receipt_marker(text: str | None) -> str:
+    """Remove the machine-readable RECEIPT: line from user-facing prose."""
+    if not text:
+        return ""
+    return _RECEIPT_LINE_RE.sub("", text).strip()
+
 
 _creds = None
 
@@ -258,7 +303,10 @@ async def upload_image(
         f"Protected Media Relative Path: {protected_url or 'N/A'}. "
         f"Subject context: {subject or 'Mobile upload'}. "
         "Extract key text, details, and context from this image and store it into my Flair visual memory. "
-        f"Pass image_url='{protected_url}' when storing the memory."
+        f"Pass image_url='{protected_url}' when storing the memory. "
+        "If this image is a receipt or invoice, extract merchant, amount, currency, and date, "
+        "pass them in store_memory custom_metadata together with image_url, keep the prose description, "
+        'and include one reply line of the form RECEIPT: {"merchant":"...","amount":"...","currency":"...","date":"..."}'
     )
 
     async with httpx.AsyncClient(headers=_auth_headers(), timeout=120) as client:
@@ -296,14 +344,20 @@ async def upload_image(
         "\n".join([p["text"] for p in parts if p.get("kind") == "text"])
         or "Photo processed and saved to visual memory."
     )
+    receipt = extract_receipt_fields(reply_text)
+    summary = strip_receipt_marker(reply_text) or reply_text
 
     return JSONResponse(
         {
             "status": "success",
             "filename": filename,
             "image_path": protected_url,
-            "summary": reply_text,
-            "reply": reply_text,
+            "summary": summary,
+            "reply": summary,
+            "merchant": receipt["merchant"],
+            "amount": receipt["amount"],
+            "currency": receipt["currency"],
+            "date": receipt["date"],
         }
     )
 
