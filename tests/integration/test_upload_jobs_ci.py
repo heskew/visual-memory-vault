@@ -20,6 +20,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+import pytest_asyncio
 import uvicorn
 from a2a.client import A2AClientError, AgentCardResolutionError
 from httpx import ASGITransport, AsyncClient
@@ -60,7 +61,7 @@ def proxy_env(tmp_path, monkeypatch):
     return tmp_path
 
 
-@pytest.fixture
+@pytest_asyncio.fixture(loop_scope="function")
 async def client(proxy_env):
     from frontend.main import app
 
@@ -223,7 +224,7 @@ async def test_upload_returns_202_before_hung_extract(client, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_a2a_4xx_is_terminal_429_and_5xx_stay_pending(client, monkeypatch):
+async def test_a2a_4xx_is_terminal_and_not_retried(client, monkeypatch):
     calls = {"n": 0}
 
     async def a2a_400(*args, **kwargs):
@@ -233,6 +234,7 @@ async def test_a2a_4xx_is_terminal_429_and_5xx_stay_pending(client, monkeypatch)
     monkeypatch.setattr("frontend.main.ingest_uploaded_image", a2a_400)
     job_id = (await _upload(client, "four.jpg")).json()["job_id"]
     first = await client.post("/ingest")
+    assert first.status_code == 200
     assert first.json()["completed"] == [job_id]
     assert (await client.get(f"/jobs/{job_id}")).json()["status"] == "failed"
     assert calls["n"] == 1
@@ -240,29 +242,6 @@ async def test_a2a_4xx_is_terminal_429_and_5xx_stay_pending(client, monkeypatch)
     second = await client.post("/ingest")
     assert second.json()["completed"] == []
     assert calls["n"] == 1
-
-    async def a2a_429(*args, **kwargs):
-        calls["n"] += 1
-        raise _a2a_http_error(429)
-
-    monkeypatch.setattr("frontend.main.ingest_uploaded_image", a2a_429)
-    retry_id = (await _upload(client, "retry.jpg")).json()["job_id"]
-    before = calls["n"]
-    await client.post("/ingest")
-    assert (await client.get(f"/jobs/{retry_id}")).json()["status"] == "pending"
-    assert calls["n"] == before + 1
-    await client.post("/ingest")
-    assert (await client.get(f"/jobs/{retry_id}")).json()["status"] == "pending"
-    assert calls["n"] == before + 2
-
-    async def a2a_503(*args, **kwargs):
-        calls["n"] += 1
-        raise _a2a_http_error(503)
-
-    monkeypatch.setattr("frontend.main.ingest_uploaded_image", a2a_503)
-    five_id = (await _upload(client, "five.jpg")).json()["job_id"]
-    await client.post("/ingest")
-    assert (await client.get(f"/jobs/{five_id}")).json()["status"] == "pending"
 
     async def a2a_403(*args, **kwargs):
         calls["n"] += 1
@@ -287,6 +266,40 @@ async def test_a2a_4xx_is_terminal_429_and_5xx_stay_pending(client, monkeypatch)
     assert (await client.get(f"/jobs/{card_id}")).json()["status"] == "failed"
     await client.post("/ingest")
     assert calls["n"] == before_card + 1
+
+
+@pytest.mark.asyncio
+async def test_a2a_429_and_5xx_stay_pending_and_retry(client, monkeypatch):
+    calls = {"n": 0}
+
+    async def a2a_429(*args, **kwargs):
+        calls["n"] += 1
+        raise _a2a_http_error(429)
+
+    monkeypatch.setattr("frontend.main.ingest_uploaded_image", a2a_429)
+    retry_id = (await _upload(client, "retry.jpg")).json()["job_id"]
+    first = await client.post("/ingest")
+    assert first.status_code == 200
+    assert first.json()["completed"] == []
+    assert (await client.get(f"/jobs/{retry_id}")).json()["status"] == "pending"
+    assert calls["n"] == 1
+    second = await client.post("/ingest")
+    assert second.json()["completed"] == []
+    assert (await client.get(f"/jobs/{retry_id}")).json()["status"] == "pending"
+    assert calls["n"] == 2
+
+    async def a2a_503(*args, **kwargs):
+        calls["n"] += 1
+        raise _a2a_http_error(503)
+
+    monkeypatch.setattr("frontend.main.ingest_uploaded_image", a2a_503)
+    five_id = (await _upload(client, "five.jpg")).json()["job_id"]
+    # Leftover 429 is still pending; drain all so the 503 job is actually attempted.
+    drained = await drain_pending_ingest_jobs()
+    assert drained == []
+    assert (await client.get(f"/jobs/{five_id}")).json()["status"] == "pending"
+    assert (await client.get(f"/jobs/{retry_id}")).json()["status"] == "pending"
+    assert calls["n"] == 4
 
 
 @pytest.mark.asyncio
