@@ -1,5 +1,6 @@
 """FastAPI proxy with API Key Authentication, Private GCS Image Persistence & Secure Authenticated Image Serving."""
 
+import asyncio
 import io
 import json
 import os
@@ -25,6 +26,7 @@ from fastapi import (
     Form,
     Header,
     HTTPException,
+    Query,
     Request,
     Response,
     UploadFile,
@@ -257,25 +259,11 @@ def normalize_image(
         return file_bytes, filename, content_type or "image/jpeg"
 
 
-@app.post("/upload")
-async def upload_image(
-    req: Request,
-    file: Annotated[UploadFile, File(...)],
-    subject: Annotated[str | None, Form()] = None,
-    x_api_key: Annotated[str | None, Header()] = None,
-):
-    """Endpoint for iOS Shortcuts and mobile apps to upload photos/screenshots."""
-    verify_api_key(req, x_api_key)
-    raw_bytes = await file.read()
-    raw_filename = file.filename or "uploaded_photo.jpg"
+_ingest_tasks: set[asyncio.Task] = set()
 
-    # Normalize HEIC / iOS images to clean JPEG
-    file_bytes, filename, media_type = normalize_image(
-        raw_bytes, raw_filename, file.content_type
-    )
 
-    # 1. Save original photo (local disk + optional GCS)
-    image_name = f"{uuid.uuid4()}_{filename}"
+def persist_uploaded_image(file_bytes: bytes, image_name: str, media_type: str) -> str:
+    """Save the image to MEDIA_DIR and optional GCS. Returns the protected /media path."""
     blob_id = f"vault-images/{image_name}"
     protected_url = f"/media/{image_name}"
 
@@ -297,8 +285,13 @@ async def upload_image(
         except Exception as e:
             print(f"Warning: Failed to upload image to GCS: {e}")
 
-    # 2. Build prompt for agent with authenticated proxy URL & image bytes
-    prompt = (
+    return protected_url
+
+
+def _upload_ingest_prompt(
+    filename: str, protected_url: str, subject: str | None
+) -> str:
+    return (
         f"I uploaded a photo/screenshot named '{filename}'. "
         f"Protected Media Relative Path: {protected_url or 'N/A'}. "
         f"Subject context: {subject or 'Mobile upload'}. "
@@ -308,6 +301,17 @@ async def upload_image(
         "pass them in store_memory custom_metadata together with image_url, keep the prose description, "
         'and include one reply line of the form RECEIPT: {"merchant":"...","amount":"...","currency":"...","date":"..."}'
     )
+
+
+async def ingest_uploaded_image(
+    file_bytes: bytes,
+    filename: str,
+    media_type: str,
+    protected_url: str,
+    subject: str | None,
+) -> str:
+    """Send the image through A2A for extract + store_memory. Returns reply text."""
+    prompt = _upload_ingest_prompt(filename, protected_url, subject)
 
     async with httpx.AsyncClient(headers=_auth_headers(), timeout=120) as client:
         card = await _get_card(client)
@@ -340,25 +344,113 @@ async def upload_image(
                 if event.HasField("artifact_update"):
                     parts.extend(_extract_parts(event.artifact_update.artifact.parts))
 
-    reply_text = (
+    return (
         "\n".join([p["text"] for p in parts if p.get("kind") == "text"])
         or "Photo processed and saved to visual memory."
     )
+
+
+async def _background_ingest(
+    file_bytes: bytes,
+    filename: str,
+    media_type: str,
+    protected_url: str,
+    subject: str | None,
+) -> None:
+    try:
+        await ingest_uploaded_image(
+            file_bytes, filename, media_type, protected_url, subject
+        )
+    except Exception as exc:
+        print(f"Error: Background memory ingest failed for {protected_url}: {exc}")
+
+
+def schedule_memory_ingest(
+    file_bytes: bytes,
+    filename: str,
+    media_type: str,
+    protected_url: str,
+    subject: str | None,
+) -> None:
+    """Start Flair ingest without blocking the HTTP response."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        import threading
+
+        threading.Thread(
+            target=lambda: asyncio.run(
+                _background_ingest(
+                    file_bytes, filename, media_type, protected_url, subject
+                )
+            ),
+            daemon=True,
+            name="memory-ingest",
+        ).start()
+        return
+
+    task = loop.create_task(
+        _background_ingest(file_bytes, filename, media_type, protected_url, subject)
+    )
+    _ingest_tasks.add(task)
+    task.add_done_callback(_ingest_tasks.discard)
+
+
+def _receipt_response_fields(reply_text: str) -> dict[str, str | None]:
     receipt = extract_receipt_fields(reply_text)
     summary = strip_receipt_marker(reply_text) or reply_text
+    return {
+        "summary": summary,
+        "reply": summary,
+        "merchant": receipt["merchant"],
+        "amount": receipt["amount"],
+        "currency": receipt["currency"],
+        "date": receipt["date"],
+    }
 
+
+@app.post("/upload")
+async def upload_image(
+    req: Request,
+    file: Annotated[UploadFile, File(...)],
+    subject: Annotated[str | None, Form()] = None,
+    x_api_key: Annotated[str | None, Header()] = None,
+    wait: Annotated[bool, Query()] = False,
+):
+    """Accept a photo from iOS Shortcuts (202 send-and-forget) or the web UI (?wait=1)."""
+    verify_api_key(req, x_api_key)
+    raw_bytes = await file.read()
+    raw_filename = file.filename or "uploaded_photo.jpg"
+
+    # Normalize HEIC / iOS images to clean JPEG
+    file_bytes, filename, media_type = normalize_image(
+        raw_bytes, raw_filename, file.content_type
+    )
+
+    image_name = f"{uuid.uuid4()}_{filename}"
+    protected_url = persist_uploaded_image(file_bytes, image_name, media_type)
+
+    if wait:
+        reply_text = await ingest_uploaded_image(
+            file_bytes, filename, media_type, protected_url, subject
+        )
+        return JSONResponse(
+            {
+                "status": "success",
+                "filename": filename,
+                "image_path": protected_url,
+                **_receipt_response_fields(reply_text),
+            }
+        )
+
+    schedule_memory_ingest(file_bytes, filename, media_type, protected_url, subject)
     return JSONResponse(
         {
-            "status": "success",
+            "status": "accepted",
             "filename": filename,
             "image_path": protected_url,
-            "summary": summary,
-            "reply": summary,
-            "merchant": receipt["merchant"],
-            "amount": receipt["amount"],
-            "currency": receipt["currency"],
-            "date": receipt["date"],
-        }
+        },
+        status_code=202,
     )
 
 

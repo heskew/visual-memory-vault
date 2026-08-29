@@ -95,14 +95,14 @@ agents-cli deploy \
 
 ### Step 4: Verify Live End-to-End Recall
 
-1. Send an image upload from your phone via the Cloud Run proxy:
+1. Send an image upload from your phone via the Cloud Run proxy (send-and-forget; expect `202 Accepted` with `image_path`, not an agent writeup):
    ```bash
    curl -X POST https://visual-memory-vault-proxy-151358874679.us-east1.run.app/upload \
      -H "X-Api-Key: <YOUR_PROXY_KEY>" \
      -F "file=@receipt.jpg" \
      -F "subject=Test Onboarding"
    ```
-2. Verify the memory appears in your `casa.heskew` Flair instance:
+   2. Verify the memory appears in your `casa.heskew` Flair instance:
    ```bash
    flair memory list --target https://casa.heskew.harperfabric.com
    ```
