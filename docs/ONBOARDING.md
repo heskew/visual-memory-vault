@@ -102,6 +102,8 @@ agents-cli deploy \
      -F "file=@receipt.jpg" \
      -F "subject=Test Onboarding"
    ```
+   Cloud Run can freeze CPU after `202` and scale the instance to zero, so a request-scoped `create_task` may never finish. The proxy writes a durable ingest job next to the image (local `MEDIA_DIR`, and the existing GCS bucket when `GCS_BUCKET_NAME` is set). A later request (`/chat`, `/upload`, `/health`) or internal `POST /ingest` drains pending jobs. Shortcut clients must not call `/ingest`.
+
    2. Verify the memory appears in your `casa.heskew` Flair instance:
    ```bash
    flair memory list --target https://casa.heskew.harperfabric.com

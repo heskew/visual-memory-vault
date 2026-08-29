@@ -1,5 +1,6 @@
 import asyncio
 import io
+import json
 import time
 from pathlib import Path
 
@@ -11,7 +12,10 @@ from starlette.requests import Request
 
 from frontend.main import (
     _extract_parts,
+    drain_pending_ingest_jobs,
     extract_receipt_fields,
+    persist_ingest_job,
+    persist_uploaded_image,
     strip_receipt_marker,
     verify_api_key,
 )
@@ -112,6 +116,7 @@ async def test_upload_returns_before_hung_agent(tmp_path, monkeypatch):
     """Shortcut POST /upload must ack before A2A/Gemini finishes."""
     monkeypatch.setattr("frontend.main.MEDIA_DIR", str(tmp_path))
     monkeypatch.setattr("frontend.main.GCS_BUCKET_NAME", None)
+    monkeypatch.setattr("frontend.main.INGEST_DRAIN_INTERVAL_SEC", 0)
 
     ingest_started = asyncio.Event()
     ingest_release = asyncio.Event()
@@ -148,10 +153,12 @@ async def test_upload_returns_before_hung_agent(tmp_path, monkeypatch):
         assert "reply" not in body
         assert "merchant" not in body
 
-        saved = list(tmp_path.iterdir())
-        assert len(saved) == 1
-        assert saved[0].name.endswith("receipt.jpg")
-        assert saved[0].stat().st_size > 0
+        images = [p for p in tmp_path.iterdir() if not p.name.endswith(".ingest.json")]
+        jobs = list(tmp_path.glob("*.ingest.json"))
+        assert len(images) == 1
+        assert images[0].name.endswith("receipt.jpg")
+        assert images[0].stat().st_size > 0
+        assert len(jobs) == 1
 
         await asyncio.wait_for(ingest_started.wait(), timeout=2)
         assert not ingest_release.is_set()
@@ -160,9 +167,10 @@ async def test_upload_returns_before_hung_agent(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_upload_persists_when_agent_never_starts(tmp_path, monkeypatch):
-    """A scheduler that never runs still leaves the photo on disk."""
+    """A scheduler that never runs still leaves the photo and ingest job on disk."""
     monkeypatch.setattr("frontend.main.MEDIA_DIR", str(tmp_path))
     monkeypatch.setattr("frontend.main.GCS_BUCKET_NAME", None)
+    monkeypatch.setattr("frontend.main.INGEST_DRAIN_INTERVAL_SEC", 0)
     monkeypatch.setattr("frontend.main.schedule_memory_ingest", lambda *a, **k: None)
 
     from frontend.main import app
@@ -178,7 +186,15 @@ async def test_upload_persists_when_agent_never_starts(tmp_path, monkeypatch):
         )
 
     assert response.status_code == 202
-    assert list(tmp_path.iterdir())
+    images = [p for p in tmp_path.iterdir() if not p.name.endswith(".ingest.json")]
+    jobs = list(tmp_path.glob("*.ingest.json"))
+    assert len(images) == 1
+    assert images[0].name.endswith("wifi.jpg")
+    assert len(jobs) == 1
+    job = json.loads(jobs[0].read_text())
+    assert job["filename"] == "wifi.jpg"
+    assert job["protected_url"].startswith("/media/")
+    assert job["image_name"].endswith("wifi.jpg")
 
 
 @pytest.mark.asyncio
@@ -186,6 +202,7 @@ async def test_upload_wait_returns_agent_summary(tmp_path, monkeypatch):
     """In-app web UI keeps a synchronous summary via ?wait=1."""
     monkeypatch.setattr("frontend.main.MEDIA_DIR", str(tmp_path))
     monkeypatch.setattr("frontend.main.GCS_BUCKET_NAME", None)
+    monkeypatch.setattr("frontend.main.INGEST_DRAIN_INTERVAL_SEC", 0)
 
     async def fake_ingest(*args, **kwargs):
         return (
@@ -214,3 +231,77 @@ async def test_upload_wait_returns_agent_summary(tmp_path, monkeypatch):
     assert body["currency"] == "USD"
     assert body["date"] == "2026-08-20"
     assert list(tmp_path.iterdir())
+    assert not list(tmp_path.glob("*.ingest.json"))
+
+
+@pytest.mark.asyncio
+async def test_drain_pending_ingest_jobs_calls_ingest(tmp_path, monkeypatch):
+    """Drain loads a persisted job and calls ingest_uploaded_image (no live Flair)."""
+    monkeypatch.setattr("frontend.main.MEDIA_DIR", str(tmp_path))
+    monkeypatch.setattr("frontend.main.GCS_BUCKET_NAME", None)
+    monkeypatch.setattr("frontend.main.INGEST_DRAIN_INTERVAL_SEC", 0)
+
+    image_name = "abc_shot.jpg"
+    persist_uploaded_image(_jpeg_bytes(), image_name, "image/jpeg")
+    persist_ingest_job(
+        image_name, "shot.jpg", "image/jpeg", f"/media/{image_name}", "WiFi"
+    )
+    assert list(tmp_path.glob("*.ingest.json"))
+
+    calls = []
+
+    async def fake_ingest(file_bytes, filename, media_type, protected_url, subject):
+        calls.append(
+            {
+                "filename": filename,
+                "media_type": media_type,
+                "protected_url": protected_url,
+                "subject": subject,
+                "nbytes": len(file_bytes),
+            }
+        )
+        return "stored"
+
+    monkeypatch.setattr("frontend.main.ingest_uploaded_image", fake_ingest)
+    completed = await drain_pending_ingest_jobs()
+
+    assert completed == [image_name]
+    assert len(calls) == 1
+    assert calls[0]["filename"] == "shot.jpg"
+    assert calls[0]["subject"] == "WiFi"
+    assert calls[0]["protected_url"] == f"/media/{image_name}"
+    assert calls[0]["nbytes"] > 0
+    assert not list(tmp_path.glob("*.ingest.json"))
+    assert (tmp_path / image_name).exists()
+
+
+@pytest.mark.asyncio
+async def test_ingest_endpoint_runs_one_persisted_job(tmp_path, monkeypatch):
+    monkeypatch.setattr("frontend.main.MEDIA_DIR", str(tmp_path))
+    monkeypatch.setattr("frontend.main.GCS_BUCKET_NAME", None)
+    monkeypatch.setattr("frontend.main.INGEST_DRAIN_INTERVAL_SEC", 0)
+
+    image_name = "xyz_menu.jpg"
+    persist_uploaded_image(_jpeg_bytes(), image_name, "image/jpeg")
+    persist_ingest_job(
+        image_name, "menu.jpg", "image/jpeg", f"/media/{image_name}", "Menu"
+    )
+
+    calls = []
+
+    async def fake_ingest(*args, **kwargs):
+        calls.append(args)
+        return "stored"
+
+    monkeypatch.setattr("frontend.main.ingest_uploaded_image", fake_ingest)
+
+    from frontend.main import app
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post("/ingest")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok", "completed": [image_name]}
+    assert len(calls) == 1
+    assert not list(tmp_path.glob("*.ingest.json"))

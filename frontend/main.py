@@ -6,6 +6,7 @@ import json
 import os
 import re
 import uuid
+from contextlib import asynccontextmanager, suppress
 from typing import Annotated
 
 import google.auth
@@ -50,6 +51,8 @@ RESOURCE = os.environ.get("AGENT_ENGINE_RESOURCE_NAME")
 AGENT_DIRECTORY = os.environ.get("AGENT_DIRECTORY", "app")
 GCS_BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME")
 MEDIA_DIR = os.path.abspath(os.environ.get("MEDIA_DIR", "./media"))
+INGEST_JOB_SUFFIX = ".ingest.json"
+INGEST_DRAIN_INTERVAL_SEC = float(os.environ.get("INGEST_DRAIN_INTERVAL_SEC", "15"))
 
 if "A2A_BASE_URL" in os.environ:
     A2A_BASE = os.environ["A2A_BASE_URL"]
@@ -142,7 +145,24 @@ def _auth_headers() -> dict[str, str]:
     return headers
 
 
-app = FastAPI(title="Visual Memory Vault Proxy")
+_ingest_tasks: set[asyncio.Task] = set()
+_ingest_in_flight: set[str] = set()
+
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    worker = asyncio.create_task(_run_ingest_drain_worker())
+    _ingest_tasks.add(worker)
+    try:
+        yield
+    finally:
+        worker.cancel()
+        _ingest_tasks.discard(worker)
+        with suppress(asyncio.CancelledError):
+            await worker
+
+
+app = FastAPI(title="Visual Memory Vault Proxy", lifespan=_lifespan)
 
 
 def verify_api_key(req: Request, x_api_key: str | None = None):
@@ -208,6 +228,7 @@ def _extract_parts(parts: list) -> list[dict]:
 @app.post("/chat")
 async def chat(req: Request):
     verify_api_key(req)
+    kick_ingest_drain()
     body = await req.json()
     message = body.get("message", "")
     user_id = body.get("user_id") or "web-user"
@@ -259,9 +280,6 @@ def normalize_image(
         return file_bytes, filename, content_type or "image/jpeg"
 
 
-_ingest_tasks: set[asyncio.Task] = set()
-
-
 def persist_uploaded_image(file_bytes: bytes, image_name: str, media_type: str) -> str:
     """Save the image to MEDIA_DIR and optional GCS. Returns the protected /media path."""
     blob_id = f"vault-images/{image_name}"
@@ -286,6 +304,201 @@ def persist_uploaded_image(file_bytes: bytes, image_name: str, media_type: str) 
             print(f"Warning: Failed to upload image to GCS: {e}")
 
     return protected_url
+
+
+def ingest_job_name(image_name: str) -> str:
+    return f"{image_name}{INGEST_JOB_SUFFIX}"
+
+
+def persist_ingest_job(
+    image_name: str,
+    filename: str,
+    media_type: str,
+    protected_url: str,
+    subject: str | None,
+) -> dict:
+    """Write a durable ingest job next to the image (MEDIA_DIR and optional GCS)."""
+    job = {
+        "image_name": image_name,
+        "filename": filename,
+        "media_type": media_type,
+        "protected_url": protected_url,
+        "subject": subject,
+    }
+    payload = json.dumps(job)
+    job_name = ingest_job_name(image_name)
+
+    try:
+        os.makedirs(MEDIA_DIR, exist_ok=True)
+        with open(os.path.join(MEDIA_DIR, job_name), "w") as f:
+            f.write(payload)
+    except Exception as e:
+        print(f"Warning: Failed to persist ingest job locally: {e}")
+
+    if GCS_BUCKET_NAME:
+        try:
+            gcs = _get_gcs_client()
+            if gcs:
+                blob = gcs.bucket(GCS_BUCKET_NAME).blob(f"vault-images/{job_name}")
+                blob.upload_from_string(payload, content_type="application/json")
+        except Exception as e:
+            print(f"Warning: Failed to persist ingest job to GCS: {e}")
+
+    return job
+
+
+def complete_ingest_job(image_name: str) -> None:
+    """Remove a finished ingest job from MEDIA_DIR and optional GCS."""
+    job_name = ingest_job_name(image_name)
+    local_path = os.path.join(MEDIA_DIR, job_name)
+    try:
+        if os.path.exists(local_path):
+            os.remove(local_path)
+    except Exception as e:
+        print(f"Warning: Failed to remove local ingest job: {e}")
+
+    if GCS_BUCKET_NAME:
+        try:
+            gcs = _get_gcs_client()
+            if gcs:
+                blob = gcs.bucket(GCS_BUCKET_NAME).blob(f"vault-images/{job_name}")
+                if blob.exists():
+                    blob.delete()
+        except Exception as e:
+            print(f"Warning: Failed to remove GCS ingest job: {e}")
+
+
+def load_uploaded_image_bytes(image_name: str) -> bytes | None:
+    local_path = os.path.join(MEDIA_DIR, image_name)
+    if os.path.exists(local_path):
+        with open(local_path, "rb") as f:
+            return f.read()
+
+    if GCS_BUCKET_NAME:
+        try:
+            gcs = _get_gcs_client()
+            if gcs:
+                blob = gcs.bucket(GCS_BUCKET_NAME).blob(f"vault-images/{image_name}")
+                if blob.exists():
+                    return blob.download_as_bytes()
+        except Exception as e:
+            print(f"Warning: Failed to load image for ingest job: {e}")
+    return None
+
+
+def _read_ingest_job_file(path: str) -> dict | None:
+    try:
+        with open(path) as f:
+            job = json.load(f)
+    except Exception as e:
+        print(f"Warning: Failed to read ingest job {path}: {e}")
+        return None
+    if isinstance(job, dict) and job.get("image_name"):
+        return job
+    return None
+
+
+def list_pending_ingest_jobs() -> list[dict]:
+    """List durable ingest jobs from MEDIA_DIR and optional GCS."""
+    seen: dict[str, dict] = {}
+    try:
+        os.makedirs(MEDIA_DIR, exist_ok=True)
+        for name in os.listdir(MEDIA_DIR):
+            if not name.endswith(INGEST_JOB_SUFFIX):
+                continue
+            job = _read_ingest_job_file(os.path.join(MEDIA_DIR, name))
+            if job:
+                seen[job["image_name"]] = job
+    except Exception as e:
+        print(f"Warning: Failed to list local ingest jobs: {e}")
+
+    if GCS_BUCKET_NAME:
+        try:
+            gcs = _get_gcs_client()
+            if gcs:
+                bucket = gcs.bucket(GCS_BUCKET_NAME)
+                for blob in bucket.list_blobs(prefix="vault-images/"):
+                    if not blob.name.endswith(INGEST_JOB_SUFFIX):
+                        continue
+                    try:
+                        job = json.loads(blob.download_as_text())
+                    except Exception as e:
+                        print(
+                            f"Warning: Failed to read GCS ingest job {blob.name}: {e}"
+                        )
+                        continue
+                    if isinstance(job, dict) and job.get("image_name"):
+                        seen.setdefault(job["image_name"], job)
+        except Exception as e:
+            print(f"Warning: Failed to list GCS ingest jobs: {e}")
+
+    return list(seen.values())
+
+
+async def process_ingest_job(job: dict, file_bytes: bytes | None = None) -> bool:
+    """Run extract+store for one persisted job. Leaves the job on failure."""
+    image_name = job["image_name"]
+    if image_name in _ingest_in_flight:
+        return False
+    _ingest_in_flight.add(image_name)
+    try:
+        data = (
+            file_bytes
+            if file_bytes is not None
+            else load_uploaded_image_bytes(image_name)
+        )
+        if not data:
+            print(f"Warning: ingest job image missing for {image_name}")
+            return False
+        await ingest_uploaded_image(
+            data,
+            job["filename"],
+            job["media_type"],
+            job["protected_url"],
+            job.get("subject"),
+        )
+        complete_ingest_job(image_name)
+        return True
+    finally:
+        _ingest_in_flight.discard(image_name)
+
+
+async def drain_pending_ingest_jobs(limit: int | None = None) -> list[str]:
+    """Process persisted ingest jobs left after a 202 / scale-to-zero."""
+    completed: list[str] = []
+    jobs = list_pending_ingest_jobs()
+    if limit is not None:
+        jobs = jobs[:limit]
+    for job in jobs:
+        try:
+            if await process_ingest_job(job):
+                completed.append(job["image_name"])
+        except Exception as exc:
+            print(f"Error: drain ingest failed for {job.get('protected_url')}: {exc}")
+    return completed
+
+
+async def _run_ingest_drain_worker() -> None:
+    interval = INGEST_DRAIN_INTERVAL_SEC
+    if interval <= 0:
+        return
+    while True:
+        try:
+            await drain_pending_ingest_jobs()
+        except Exception as exc:
+            print(f"Error: ingest drain worker failed: {exc}")
+        await asyncio.sleep(interval)
+
+
+def kick_ingest_drain() -> None:
+    """Best-effort drain on a later request if the first instance died."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    task = loop.create_task(drain_pending_ingest_jobs())
+    _ingest_tasks.add(task)
+    task.add_done_callback(_ingest_tasks.discard)
 
 
 def _upload_ingest_prompt(
@@ -356,11 +569,17 @@ async def _background_ingest(
     media_type: str,
     protected_url: str,
     subject: str | None,
+    image_name: str,
 ) -> None:
+    job = {
+        "image_name": image_name,
+        "filename": filename,
+        "media_type": media_type,
+        "protected_url": protected_url,
+        "subject": subject,
+    }
     try:
-        await ingest_uploaded_image(
-            file_bytes, filename, media_type, protected_url, subject
-        )
+        await process_ingest_job(job, file_bytes=file_bytes)
     except Exception as exc:
         print(f"Error: Background memory ingest failed for {protected_url}: {exc}")
 
@@ -371,6 +590,7 @@ def schedule_memory_ingest(
     media_type: str,
     protected_url: str,
     subject: str | None,
+    image_name: str,
 ) -> None:
     """Start Flair ingest without blocking the HTTP response."""
     try:
@@ -381,7 +601,12 @@ def schedule_memory_ingest(
         threading.Thread(
             target=lambda: asyncio.run(
                 _background_ingest(
-                    file_bytes, filename, media_type, protected_url, subject
+                    file_bytes,
+                    filename,
+                    media_type,
+                    protected_url,
+                    subject,
+                    image_name,
                 )
             ),
             daemon=True,
@@ -390,7 +615,9 @@ def schedule_memory_ingest(
         return
 
     task = loop.create_task(
-        _background_ingest(file_bytes, filename, media_type, protected_url, subject)
+        _background_ingest(
+            file_bytes, filename, media_type, protected_url, subject, image_name
+        )
     )
     _ingest_tasks.add(task)
     task.add_done_callback(_ingest_tasks.discard)
@@ -431,6 +658,7 @@ async def upload_image(
     protected_url = persist_uploaded_image(file_bytes, image_name, media_type)
 
     if wait:
+        kick_ingest_drain()
         reply_text = await ingest_uploaded_image(
             file_bytes, filename, media_type, protected_url, subject
         )
@@ -443,7 +671,10 @@ async def upload_image(
             }
         )
 
-    schedule_memory_ingest(file_bytes, filename, media_type, protected_url, subject)
+    persist_ingest_job(image_name, filename, media_type, protected_url, subject)
+    schedule_memory_ingest(
+        file_bytes, filename, media_type, protected_url, subject, image_name
+    )
     return JSONResponse(
         {
             "status": "accepted",
@@ -460,6 +691,7 @@ async def get_media(
 ):
     """Authenticated image retrieval endpoint requiring API Key verification."""
     verify_api_key(req, x_api_key)
+    kick_ingest_drain()
 
     # 1. Check local media directory first
     local_path = os.path.join(MEDIA_DIR, image_name)
@@ -484,6 +716,23 @@ async def get_media(
             print(f"Warning: GCS image fetch failed: {e}")
 
     raise HTTPException(status_code=404, detail="Image not found")
+
+
+@app.get("/health")
+async def health():
+    """Liveness probe; also drains persisted ingest jobs if a prior 202 died."""
+    kick_ingest_drain()
+    return JSONResponse({"status": "ok"})
+
+
+@app.post("/ingest")
+async def ingest_pending(
+    req: Request, x_api_key: Annotated[str | None, Header()] = None
+):
+    """Internal: run one persisted ingest job. Shortcut clients must not call this."""
+    verify_api_key(req, x_api_key)
+    completed = await drain_pending_ingest_jobs(limit=1)
+    return JSONResponse({"status": "ok", "completed": completed})
 
 
 static_dir = "static" if os.path.exists("static") else "frontend/static"
