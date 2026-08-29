@@ -7,6 +7,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+from a2a.client import A2AClientError
 from fastapi import HTTPException
 from httpx import ASGITransport, AsyncClient
 from PIL import Image
@@ -557,3 +558,71 @@ async def test_successful_store_stays_succeeded_if_job_write_fails(
     assert updated["status"] == "succeeded"
     assert updated["summary"] == "stored"
     assert updated.get("error") is None
+
+
+def _a2a_http_error(status_code: int) -> A2AClientError:
+    """Match a2a.client.transports.http_helpers.handle_http_exceptions."""
+    request = httpx.Request("POST", "http://127.0.0.1/a2a")
+    response = httpx.Response(status_code, request=request)
+    http_err = httpx.HTTPStatusError("bad request", request=request, response=response)
+    exc = A2AClientError(f"HTTP Error {status_code}: {http_err}")
+    exc.__cause__ = http_err
+    return exc
+
+
+@pytest.mark.asyncio
+async def test_a2a_http_400_marks_job_failed_and_is_not_retried(tmp_path, monkeypatch):
+    monkeypatch.setattr("frontend.main.MEDIA_DIR", str(tmp_path))
+    monkeypatch.setattr("frontend.main.GCS_BUCKET_NAME", None)
+    monkeypatch.setattr("frontend.main.INGEST_DRAIN_INTERVAL_SEC", 0)
+
+    persist_uploaded_image(_jpeg_bytes(), "shot.jpg", "image/jpeg")
+    job = enqueue_ingest_job(
+        "shot.jpg", "shot.jpg", "image/jpeg", "/media/shot.jpg", "WiFi"
+    )
+
+    async def a2a_400(*args, **kwargs):
+        raise _a2a_http_error(400)
+
+    monkeypatch.setattr("frontend.main.ingest_uploaded_image", a2a_400)
+    completed = await drain_pending_ingest_jobs()
+    assert completed == [job["job_id"]]
+    stored = load_job(job["job_id"])
+    assert stored["status"] == "failed"
+    assert stored["error"] == "ingest_failed"
+
+    async def never(*args, **kwargs):
+        raise AssertionError("A2A 4xx jobs must not be retried")
+
+    monkeypatch.setattr("frontend.main.ingest_uploaded_image", never)
+    assert await drain_pending_ingest_jobs() == []
+
+
+@pytest.mark.asyncio
+async def test_get_job_falls_back_to_local_cache_when_gcs_read_fails(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr("frontend.main.MEDIA_DIR", str(tmp_path))
+    monkeypatch.setattr("frontend.main.GCS_BUCKET_NAME", "existing-bucket")
+    monkeypatch.setattr("frontend.main.INGEST_DRAIN_INTERVAL_SEC", 0)
+
+    job_id = "22222222-2222-4222-8222-222222222222"
+    cached = _job_record(job_id, "pending")
+    (tmp_path / "jobs").mkdir(parents=True)
+    (tmp_path / "jobs" / f"{job_id}.json").write_text(json.dumps(cached))
+
+    def gcs_boom():
+        raise RuntimeError("GCS unavailable")
+
+    monkeypatch.setattr("frontend.main._get_gcs_client", gcs_boom)
+
+    from frontend.main import app
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get(f"/jobs/{job_id}")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["job_id"] == job_id
+    assert body["status"] == "pending"

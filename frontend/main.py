@@ -12,7 +12,13 @@ from typing import Annotated
 import google.auth
 import google.auth.transport.requests
 import httpx
-from a2a.client import ClientConfig, ClientFactory
+from a2a.client import (
+    A2AClientError,
+    A2AClientTimeoutError,
+    AgentCardResolutionError,
+    ClientConfig,
+    ClientFactory,
+)
 from a2a.types import (
     AgentCard,
     Message,
@@ -295,14 +301,33 @@ class TerminalIngestError(Exception):
     """Permanent extract/store failure. Job is marked failed."""
 
 
+_A2A_HTTP_ERROR_RE = re.compile(r"HTTP Error (\d+):")
+
+
+def _http_status_from_ingest_exc(exc: BaseException) -> int | None:
+    """Status from httpx, AgentCardResolutionError, or A2AClientError('HTTP Error N:')."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code
+    if isinstance(exc, AgentCardResolutionError) and exc.status_code is not None:
+        return exc.status_code
+    cause = exc.__cause__
+    if isinstance(cause, httpx.HTTPStatusError):
+        return cause.response.status_code
+    if isinstance(exc, A2AClientError):
+        match = _A2A_HTTP_ERROR_RE.match(str(exc))
+        if match:
+            return int(match.group(1))
+    return None
+
+
 def is_transient_ingest_error(exc: BaseException) -> bool:
     """A2A/Flair timeouts and 5xx/429 stay pending; 4xx and TerminalIngestError fail."""
     if isinstance(exc, TerminalIngestError):
         return False
-    if isinstance(exc, TransientIngestError):
+    if isinstance(exc, (TransientIngestError, A2AClientTimeoutError)):
         return True
-    if isinstance(exc, httpx.HTTPStatusError):
-        code = exc.response.status_code
+    code = _http_status_from_ingest_exc(exc)
+    if code is not None:
         return code == 429 or code >= 500
     if isinstance(
         exc, (httpx.TimeoutException, httpx.NetworkError, httpx.RequestError)
@@ -414,8 +439,19 @@ def _write_local_job_cache(job: dict) -> None:
         print(f"Warning: Failed to refresh local job cache: {e}")
 
 
+def _load_local_job(job_id: str) -> dict | None:
+    local_path = _job_local_path(job_id)
+    if os.path.exists(local_path):
+        try:
+            with open(local_path) as f:
+                return _decode_job_payload(f.read())
+        except Exception as e:
+            print(f"Warning: Failed to read local job record: {e}")
+    return None
+
+
 def load_job(job_id: str) -> dict | None:
-    """Load a job. GCS is source of truth when GCS_BUCKET_NAME is set."""
+    """Load a job. GCS is source of truth when readable; local cache on GCS errors."""
     if GCS_BUCKET_NAME:
         try:
             gcs = _get_gcs_client()
@@ -426,18 +462,13 @@ def load_job(job_id: str) -> dict | None:
                     if job:
                         _write_local_job_cache(job)
                     return job
+                return None
         except Exception as e:
             print(f"Warning: Failed to read GCS job record: {e}")
+            return _load_local_job(job_id)
         return None
 
-    local_path = _job_local_path(job_id)
-    if os.path.exists(local_path):
-        try:
-            with open(local_path) as f:
-                return _decode_job_payload(f.read())
-        except Exception as e:
-            print(f"Warning: Failed to read local job record: {e}")
-    return None
+    return _load_local_job(job_id)
 
 
 def enqueue_ingest_job(
