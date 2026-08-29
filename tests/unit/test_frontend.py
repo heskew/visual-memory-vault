@@ -1,6 +1,7 @@
 import asyncio
 import io
 import json
+import subprocess
 import time
 from pathlib import Path
 
@@ -11,10 +12,13 @@ from PIL import Image
 from starlette.requests import Request
 
 from frontend.main import (
+    EnqueueError,
+    PersistError,
     _extract_parts,
     drain_pending_ingest_jobs,
+    enqueue_ingest_job,
     extract_receipt_fields,
-    persist_ingest_job,
+    load_job,
     persist_uploaded_image,
     strip_receipt_marker,
     verify_api_key,
@@ -108,22 +112,41 @@ def test_index_html_has_three_row_receipt_chip():
     assert "receipt-row amount" in html
     assert "receipt-row date" in html
     assert "function receiptChip" in html
-    assert "/upload?wait=1" in html
+    assert "wait=1" not in html
+    assert "vault-upload.js" in html
+    assert "pollJob" in html
+
+
+def test_web_ui_polls_jobs_not_wait_flag():
+    html = Path("frontend/static/index.html").read_text()
+    js = Path("frontend/static/vault-upload.js").read_text()
+    assert "wait=1" not in html
+    assert "wait=1" not in js
+    assert 'fetchImpl("/upload"' in js or 'fetchImpl("/upload",' in js
+    assert "/jobs/" in js
+    assert "pollJob" in js
+    result = subprocess.run(
+        ["node", "tests/unit/test_vault_upload.js"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 @pytest.mark.asyncio
 async def test_upload_returns_before_hung_agent(tmp_path, monkeypatch):
-    """Shortcut POST /upload must ack before A2A/Gemini finishes."""
+    """POST /upload must ack before A2A/Gemini; ingest is not in the request."""
     monkeypatch.setattr("frontend.main.MEDIA_DIR", str(tmp_path))
     monkeypatch.setattr("frontend.main.GCS_BUCKET_NAME", None)
     monkeypatch.setattr("frontend.main.INGEST_DRAIN_INTERVAL_SEC", 0)
 
-    ingest_started = asyncio.Event()
-    ingest_release = asyncio.Event()
+    ingest_called = False
 
     async def hung_ingest(*args, **kwargs):
-        ingest_started.set()
-        await ingest_release.wait()
+        nonlocal ingest_called
+        ingest_called = True
+        await asyncio.sleep(3600)
         return "should not reach the shortcut client"
 
     monkeypatch.setattr("frontend.main.ingest_uploaded_image", hung_ingest)
@@ -147,91 +170,128 @@ async def test_upload_returns_before_hung_agent(tmp_path, monkeypatch):
         assert elapsed < 2
         body = response.json()
         assert body["status"] == "accepted"
-        assert body["filename"] == "receipt.jpg"
+        assert body["job_id"]
         assert body["image_path"].startswith("/media/")
         assert "summary" not in body
         assert "reply" not in body
         assert "merchant" not in body
+        assert not ingest_called
 
-        images = [p for p in tmp_path.iterdir() if not p.name.endswith(".ingest.json")]
-        jobs = list(tmp_path.glob("*.ingest.json"))
-        assert len(images) == 1
-        assert images[0].name.endswith("receipt.jpg")
-        assert images[0].stat().st_size > 0
-        assert len(jobs) == 1
-
-        await asyncio.wait_for(ingest_started.wait(), timeout=2)
-        assert not ingest_release.is_set()
-        ingest_release.set()
+        job = load_job(body["job_id"])
+        assert job is not None
+        assert job["status"] == "pending"
 
 
 @pytest.mark.asyncio
-async def test_upload_persists_when_agent_never_starts(tmp_path, monkeypatch):
-    """A scheduler that never runs still leaves the photo and ingest job on disk."""
+async def test_job_pollable_after_process_restart(tmp_path, monkeypatch):
+    """Job records survive a simulated process restart (durable store, not RAM)."""
     monkeypatch.setattr("frontend.main.MEDIA_DIR", str(tmp_path))
     monkeypatch.setattr("frontend.main.GCS_BUCKET_NAME", None)
     monkeypatch.setattr("frontend.main.INGEST_DRAIN_INTERVAL_SEC", 0)
-    monkeypatch.setattr("frontend.main.schedule_memory_ingest", lambda *a, **k: None)
-
-    from frontend.main import app
-
-    transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
-        response = await asyncio.wait_for(
-            client.post(
-                "/upload",
-                files={"file": ("wifi.jpg", _jpeg_bytes(), "image/jpeg")},
-            ),
-            timeout=3,
-        )
-
-    assert response.status_code == 202
-    images = [p for p in tmp_path.iterdir() if not p.name.endswith(".ingest.json")]
-    jobs = list(tmp_path.glob("*.ingest.json"))
-    assert len(images) == 1
-    assert images[0].name.endswith("wifi.jpg")
-    assert len(jobs) == 1
-    job = json.loads(jobs[0].read_text())
-    assert job["filename"] == "wifi.jpg"
-    assert job["protected_url"].startswith("/media/")
-    assert job["image_name"].endswith("wifi.jpg")
-
-
-@pytest.mark.asyncio
-async def test_upload_wait_returns_agent_summary(tmp_path, monkeypatch):
-    """In-app web UI keeps a synchronous summary via ?wait=1."""
-    monkeypatch.setattr("frontend.main.MEDIA_DIR", str(tmp_path))
-    monkeypatch.setattr("frontend.main.GCS_BUCKET_NAME", None)
-    monkeypatch.setattr("frontend.main.INGEST_DRAIN_INTERVAL_SEC", 0)
-
-    async def fake_ingest(*args, **kwargs):
-        return (
-            "Saved dinner at Joe's Grill.\n"
-            'RECEIPT: {"merchant":"Joe\'s Grill","amount":"58.40","currency":"USD","date":"2026-08-20"}'
-        )
-
-    monkeypatch.setattr("frontend.main.ingest_uploaded_image", fake_ingest)
 
     from frontend.main import app
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.post(
-            "/upload?wait=1",
+            "/upload",
+            files={"file": ("wifi.jpg", _jpeg_bytes(), "image/jpeg")},
+        )
+        assert response.status_code == 202
+        job_id = response.json()["job_id"]
+
+        monkeypatch.setattr("frontend.main._ingest_in_flight", set())
+        monkeypatch.setattr("frontend.main._card", None)
+
+        pending = await client.get(f"/jobs/{job_id}")
+        assert pending.status_code == 200
+        assert pending.json()["status"] == "pending"
+        assert pending.json()["job_id"] == job_id
+
+        disk = json.loads((tmp_path / "jobs" / f"{job_id}.json").read_text())
+        assert disk["status"] == "pending"
+
+        async def fake_ingest(*args, **kwargs):
+            return (
+                "Saved hotel WiFi card.\n"
+                'RECEIPT: {"merchant":"Hotel","amount":"0","currency":"USD","date":"2026-08-29"}'
+            )
+
+        monkeypatch.setattr("frontend.main.ingest_uploaded_image", fake_ingest)
+        completed = await drain_pending_ingest_jobs()
+        assert job_id in completed
+
+        monkeypatch.setattr("frontend.main._ingest_in_flight", set())
+        done = await client.get(f"/jobs/{job_id}")
+        assert done.status_code == 200
+        body = done.json()
+        assert body["status"] == "succeeded"
+        assert body["summary"] == "Saved hotel WiFi card."
+        assert body["merchant"] == "Hotel"
+
+
+@pytest.mark.asyncio
+async def test_get_job_requires_auth_and_unknown_is_404(tmp_path, monkeypatch):
+    monkeypatch.setattr("frontend.main.MEDIA_DIR", str(tmp_path))
+    monkeypatch.setattr("frontend.main.GCS_BUCKET_NAME", None)
+    monkeypatch.setattr("frontend.main.INGEST_DRAIN_INTERVAL_SEC", 0)
+    monkeypatch.setattr("frontend.main.API_KEY", "secret-key")
+
+    from frontend.main import app
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        denied = await client.get("/jobs/11111111-1111-1111-1111-111111111111")
+        assert denied.status_code == 401
+
+        missing = await client.get(
+            "/jobs/11111111-1111-1111-1111-111111111111",
+            headers={"X-Api-Key": "secret-key"},
+        )
+        assert missing.status_code == 404
+
+        bogus = await client.get(
+            "/jobs/not-a-uuid",
+            headers={"X-Api-Key": "secret-key"},
+        )
+        assert bogus.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_persist_or_enqueue_failure_is_not_202(tmp_path, monkeypatch):
+    monkeypatch.setattr("frontend.main.MEDIA_DIR", str(tmp_path))
+    monkeypatch.setattr("frontend.main.GCS_BUCKET_NAME", None)
+    monkeypatch.setattr("frontend.main.INGEST_DRAIN_INTERVAL_SEC", 0)
+
+    from frontend.main import app
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+
+        def persist_boom(*args, **kwargs):
+            raise PersistError("disk full")
+
+        monkeypatch.setattr("frontend.main.persist_uploaded_image", persist_boom)
+        persist_fail = await client.post(
+            "/upload",
             files={"file": ("receipt.jpg", _jpeg_bytes(), "image/jpeg")},
         )
+        assert persist_fail.status_code != 202
 
-    assert response.status_code == 200
-    body = response.json()
-    assert body["status"] == "success"
-    assert body["reply"] == "Saved dinner at Joe's Grill."
-    assert body["summary"] == "Saved dinner at Joe's Grill."
-    assert body["merchant"] == "Joe's Grill"
-    assert body["amount"] == "58.40"
-    assert body["currency"] == "USD"
-    assert body["date"] == "2026-08-20"
-    assert list(tmp_path.iterdir())
-    assert not list(tmp_path.glob("*.ingest.json"))
+        monkeypatch.setattr(
+            "frontend.main.persist_uploaded_image",
+            lambda *a, **k: "/media/ok.jpg",
+        )
+
+        def enqueue_boom(*args, **kwargs):
+            raise EnqueueError("job store down")
+
+        monkeypatch.setattr("frontend.main.enqueue_ingest_job", enqueue_boom)
+        enqueue_fail = await client.post(
+            "/upload",
+            files={"file": ("receipt.jpg", _jpeg_bytes(), "image/jpeg")},
+        )
+        assert enqueue_fail.status_code != 202
 
 
 @pytest.mark.asyncio
@@ -243,10 +303,9 @@ async def test_drain_pending_ingest_jobs_calls_ingest(tmp_path, monkeypatch):
 
     image_name = "abc_shot.jpg"
     persist_uploaded_image(_jpeg_bytes(), image_name, "image/jpeg")
-    persist_ingest_job(
+    job = enqueue_ingest_job(
         image_name, "shot.jpg", "image/jpeg", f"/media/{image_name}", "WiFi"
     )
-    assert list(tmp_path.glob("*.ingest.json"))
 
     calls = []
 
@@ -265,14 +324,13 @@ async def test_drain_pending_ingest_jobs_calls_ingest(tmp_path, monkeypatch):
     monkeypatch.setattr("frontend.main.ingest_uploaded_image", fake_ingest)
     completed = await drain_pending_ingest_jobs()
 
-    assert completed == [image_name]
+    assert completed == [job["job_id"]]
     assert len(calls) == 1
     assert calls[0]["filename"] == "shot.jpg"
     assert calls[0]["subject"] == "WiFi"
-    assert calls[0]["protected_url"] == f"/media/{image_name}"
-    assert calls[0]["nbytes"] > 0
-    assert not list(tmp_path.glob("*.ingest.json"))
-    assert (tmp_path / image_name).exists()
+    stored = load_job(job["job_id"])
+    assert stored["status"] == "succeeded"
+    assert stored["summary"] == "stored"
 
 
 @pytest.mark.asyncio
@@ -283,7 +341,7 @@ async def test_ingest_endpoint_runs_one_persisted_job(tmp_path, monkeypatch):
 
     image_name = "xyz_menu.jpg"
     persist_uploaded_image(_jpeg_bytes(), image_name, "image/jpeg")
-    persist_ingest_job(
+    job = enqueue_ingest_job(
         image_name, "menu.jpg", "image/jpeg", f"/media/{image_name}", "Menu"
     )
 
@@ -302,6 +360,6 @@ async def test_ingest_endpoint_runs_one_persisted_job(tmp_path, monkeypatch):
         response = await client.post("/ingest")
 
     assert response.status_code == 200
-    assert response.json() == {"status": "ok", "completed": [image_name]}
+    assert response.json() == {"status": "ok", "completed": [job["job_id"]]}
     assert len(calls) == 1
-    assert not list(tmp_path.glob("*.ingest.json"))
+    assert load_job(job["job_id"])["status"] == "succeeded"

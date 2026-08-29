@@ -95,14 +95,14 @@ agents-cli deploy \
 
 ### Step 4: Verify Live End-to-End Recall
 
-1. Send an image upload from your phone via the Cloud Run proxy (send-and-forget; expect `202 Accepted` with `image_path`, not an agent writeup):
+1. Send an image upload from your phone via the Cloud Run proxy (send-and-forget; expect `202 Accepted` with `job_id` + `image_path`, not an agent writeup):
    ```bash
    curl -X POST https://visual-memory-vault-proxy-151358874679.us-east1.run.app/upload \
      -H "X-Api-Key: <YOUR_PROXY_KEY>" \
      -F "file=@receipt.jpg" \
      -F "subject=Test Onboarding"
    ```
-   Cloud Run can freeze CPU after `202` and scale the instance to zero, so a request-scoped `create_task` may never finish. The proxy writes a durable ingest job next to the image (local `MEDIA_DIR`, and the existing GCS bucket when `GCS_BUCKET_NAME` is set). A later request (`/chat`, `/upload`, `/health`) or internal `POST /ingest` drains pending jobs. Shortcut clients must not call `/ingest`.
+   Cloud Run is HTTP edge only and may scale to zero after `202`. The upload request does not run Gemini/Flair and does not rely on `create_task`. Persist the image and enqueue a durable job record (`vault-jobs/` in the existing GCS bucket when `GCS_BUCKET_NAME` is set; local `MEDIA_DIR/jobs/` for development). A worker (`POST /ingest`, or the process drain loop because jobs exist) talks to Agent Engine. Poll `GET /jobs/{job_id}` for `pending` / `succeeded` / `failed`. Shortcut clients must not call `/ingest`.
 
    2. Verify the memory appears in your `casa.heskew` Flair instance:
    ```bash

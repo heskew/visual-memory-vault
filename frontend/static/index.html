@@ -63,6 +63,7 @@
   <button type="submit">Send</button>
 </form>
 
+<script src="vault-upload.js"></script>
 <script>
 const log = document.getElementById("log");
 const form = document.getElementById("form");
@@ -217,24 +218,18 @@ fileInput.addEventListener("change", async () => {
   bubble("user").textContent = `[Uploaded Photo: ${file.name}]`;
   const b = bubble("agent"); b.textContent = "Processing image & saving to Flair memory…";
 
-  const formData = new FormData();
-  formData.append("file", file);
-  formData.append("subject", file.name);
-
   try {
-    // wait=1 keeps the in-app summary/receipt chip. Shortcuts POST /upload without it.
-    const res = await fetch("/upload?wait=1", { method: "POST", body: formData });
-    const raw = await res.text();
-    let data;
-    try { data = JSON.parse(raw); }
-    catch { throw new Error(`Server returned non-JSON (HTTP ${res.status}). ${raw.slice(0, 300)}`); }
+    const accepted = await VaultUpload.uploadPhoto(file, fetch);
+    b.textContent = "Photo saved. Extracting…";
+    const job = await VaultUpload.pollJob(accepted.job_id, fetch);
     b.textContent = "";
-    const chip = receiptChip(data);
+    if (job.status === "failed") {
+      b.textContent = "Saved the photo, but memory ingest failed.";
+      return;
+    }
+    const chip = receiptChip(job);
     if (chip) b.appendChild(chip);
-    const fallback = res.status === 202
-      ? "Photo saved. Memory ingest is running in the background."
-      : "Photo saved to Visual Memory!";
-    b.appendChild(el("div", null, data.reply || data.summary || fallback));
+    b.appendChild(el("div", null, job.reply || job.summary || "Photo saved to Visual Memory!"));
   } catch (e) {
     b.textContent = "Upload Error: " + e.message;
   } finally {

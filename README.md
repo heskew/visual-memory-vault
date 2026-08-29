@@ -41,7 +41,7 @@ flowchart TD
     subgraph Capture["Ingestion Surfaces"]
         Web["Web UI (Chat + Photo Upload)"]
         iOS["Mobile & iOS Shortcuts"]
-        Persist["Local / GCS persist"]
+        Persist["Image + durable job (GCS / local)"]
         A2A["Peer Agents (A2A Protocol)"]
     end
 
@@ -57,9 +57,10 @@ flowchart TD
         Vector["Semantic Index & Graph Recall"]
     end
 
-    Web -->|Upload ?wait=1 / Chat| Agent
+    Web -->|POST /upload 202 then GET /jobs| Persist
+    Web -->|Chat| Agent
     iOS -->|POST /upload 202| Persist
-    Persist -.->|background ingest| Agent
+    Persist -->|worker / POST /ingest| Agent
     A2A -->|JSON-RPC Stream| Agent
 
     Agent -->|Multimodal Analysis| Gemini
@@ -135,7 +136,7 @@ Open **`http://localhost:8080`** in your browser to start chatting and uploading
 
 ## 📱 Mobile Ingestion (iOS Shortcuts / curl)
 
-Upload photos directly from your phone camera or automated workflow. This is **send-and-forget**: the proxy persists the image and returns immediately. Flair extract + `store_memory` continues in the background. Do not wait on a summary or `RECEIPT` line — iOS Shortcuts typically time out around 30s if they do.
+Upload photos directly from your phone camera or automated workflow. This is **send-and-forget**: the proxy persists the image, enqueues a durable ingest job, and returns immediately. Do not wait on a summary or `RECEIPT` line — iOS Shortcuts typically time out around 30s if they do.
 
 ```bash
 curl -X POST http://localhost:8080/upload \
@@ -147,12 +148,12 @@ Response (`202 Accepted`):
 ```json
 {
   "status": "accepted",
-  "filename": "receipt.jpg",
+  "job_id": "<uuid>",
   "image_path": "/media/<uuid>_receipt.jpg"
 }
 ```
 
-The in-app web UI still waits for the agent writeup via `POST /upload?wait=1`.
+The in-app web UI uses the same `POST /upload`, then polls `GET /jobs/{job_id}` until extract + `store_memory` finishes and the receipt chip can render.
 
 ---
 
