@@ -287,6 +287,30 @@ class EnqueueError(Exception):
     """Durable job enqueue failed."""
 
 
+class TransientIngestError(Exception):
+    """Retryable extract/store failure. Job stays pending."""
+
+
+class TerminalIngestError(Exception):
+    """Permanent extract/store failure. Job is marked failed."""
+
+
+def is_transient_ingest_error(exc: BaseException) -> bool:
+    """A2A/Flair timeouts and 5xx/429 stay pending; 4xx and TerminalIngestError fail."""
+    if isinstance(exc, TerminalIngestError):
+        return False
+    if isinstance(exc, TransientIngestError):
+        return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        code = exc.response.status_code
+        return code == 429 or code >= 500
+    if isinstance(
+        exc, (httpx.TimeoutException, httpx.NetworkError, httpx.RequestError)
+    ):
+        return True
+    return True
+
+
 def persist_uploaded_image(file_bytes: bytes, image_name: str, media_type: str) -> str:
     """Save the image to MEDIA_DIR and optional GCS. Raises if the durable copy fails."""
     blob_id = f"vault-images/{image_name}"
@@ -380,27 +404,39 @@ def write_job_record(job: dict) -> None:
         raise EnqueueError("local job enqueue failed")
 
 
-def load_job(job_id: str) -> dict | None:
-    """Load a job from local jobs/ or GCS. Source of truth is the durable store."""
-    local_path = _job_local_path(job_id)
-    if os.path.exists(local_path):
-        try:
-            with open(local_path) as f:
-                job = _decode_job_payload(f.read())
-            if job:
-                return job
-        except Exception as e:
-            print(f"Warning: Failed to read local job record: {e}")
+def _write_local_job_cache(job: dict) -> None:
+    """Best-effort local cache. Never overrides GCS as source of truth."""
+    try:
+        os.makedirs(os.path.join(MEDIA_DIR, JOBS_DIR_NAME), exist_ok=True)
+        with open(_job_local_path(job["job_id"]), "w") as f:
+            f.write(json.dumps(job))
+    except Exception as e:
+        print(f"Warning: Failed to refresh local job cache: {e}")
 
+
+def load_job(job_id: str) -> dict | None:
+    """Load a job. GCS is source of truth when GCS_BUCKET_NAME is set."""
     if GCS_BUCKET_NAME:
         try:
             gcs = _get_gcs_client()
             if gcs:
                 blob = gcs.bucket(GCS_BUCKET_NAME).blob(_job_gcs_name(job_id))
                 if blob.exists():
-                    return _decode_job_payload(blob.download_as_text())
+                    job = _decode_job_payload(blob.download_as_text())
+                    if job:
+                        _write_local_job_cache(job)
+                    return job
         except Exception as e:
             print(f"Warning: Failed to read GCS job record: {e}")
+        return None
+
+    local_path = _job_local_path(job_id)
+    if os.path.exists(local_path):
+        try:
+            with open(local_path) as f:
+                return _decode_job_payload(f.read())
+        except Exception as e:
+            print(f"Warning: Failed to read local job record: {e}")
     return None
 
 
@@ -451,8 +487,23 @@ def load_uploaded_image_bytes(image_name: str) -> bytes | None:
 
 
 def list_pending_ingest_jobs() -> list[dict]:
-    """List pending jobs from the durable store (local jobs/ and optional GCS)."""
+    """List pending jobs. GCS is source of truth when GCS_BUCKET_NAME is set."""
     seen: dict[str, dict] = {}
+    if GCS_BUCKET_NAME:
+        try:
+            gcs = _get_gcs_client()
+            if gcs:
+                bucket = gcs.bucket(GCS_BUCKET_NAME)
+                for blob in bucket.list_blobs(prefix=JOBS_GCS_PREFIX):
+                    if not blob.name.endswith(".json"):
+                        continue
+                    job = _decode_job_payload(blob.download_as_text())
+                    if job and job.get("status") == "pending":
+                        seen[job["job_id"]] = job
+        except Exception as e:
+            print(f"Warning: Failed to list GCS ingest jobs: {e}")
+        return list(seen.values())
+
     jobs_dir = os.path.join(MEDIA_DIR, JOBS_DIR_NAME)
     try:
         os.makedirs(jobs_dir, exist_ok=True)
@@ -469,21 +520,6 @@ def list_pending_ingest_jobs() -> list[dict]:
                 seen[job["job_id"]] = job
     except Exception as e:
         print(f"Warning: Failed to list local ingest jobs: {e}")
-
-    if GCS_BUCKET_NAME:
-        try:
-            gcs = _get_gcs_client()
-            if gcs:
-                bucket = gcs.bucket(GCS_BUCKET_NAME)
-                for blob in bucket.list_blobs(prefix=JOBS_GCS_PREFIX):
-                    if not blob.name.endswith(".json"):
-                        continue
-                    job = _decode_job_payload(blob.download_as_text())
-                    if job and job.get("status") == "pending":
-                        seen.setdefault(job["job_id"], job)
-        except Exception as e:
-            print(f"Warning: Failed to list GCS ingest jobs: {e}")
-
     return list(seen.values())
 
 
@@ -501,6 +537,16 @@ def job_public_view(job: dict) -> dict:
     return view
 
 
+def _mark_job_failed(job: dict, error: str) -> dict:
+    job["status"] = "failed"
+    job["error"] = error
+    try:
+        write_job_record(job)
+    except EnqueueError as write_exc:
+        print(f"Warning: Failed to persist failed job {job['job_id']}: {write_exc}")
+    return job
+
+
 async def process_ingest_job(job: dict) -> dict:
     """Run extract+store for one persisted job. Updates the durable record."""
     job_id = job["job_id"]
@@ -510,31 +556,32 @@ async def process_ingest_job(job: dict) -> dict:
     try:
         data = load_uploaded_image_bytes(job["image_name"])
         if not data:
-            job["status"] = "failed"
-            job["error"] = "image_missing"
-            write_job_record(job)
-            return job
-        reply_text = await ingest_uploaded_image(
-            data,
-            job["filename"],
-            job["media_type"],
-            job.get("image_path") or job.get("protected_url"),
-            job.get("subject"),
-        )
+            return _mark_job_failed(job, "image_missing")
+        try:
+            reply_text = await ingest_uploaded_image(
+                data,
+                job["filename"],
+                job["media_type"],
+                job.get("image_path") or job.get("protected_url"),
+                job.get("subject"),
+            )
+        except Exception as exc:
+            if is_transient_ingest_error(exc):
+                print(f"Warning: transient ingest error for {job_id}: {exc}")
+                return job
+            print(f"Error: ingest job {job_id} failed: {exc}")
+            return _mark_job_failed(job, "ingest_failed")
         fields = _receipt_response_fields(reply_text)
         job["status"] = "succeeded"
         job["error"] = None
         job.update(fields)
-        write_job_record(job)
-        return job
-    except Exception as exc:
-        print(f"Error: ingest job {job_id} failed: {exc}")
-        job["status"] = "failed"
-        job["error"] = "ingest_failed"
         try:
             write_job_record(job)
-        except Exception as write_exc:
-            print(f"Warning: Failed to persist failed job {job_id}: {write_exc}")
+        except EnqueueError as write_exc:
+            print(
+                f"Warning: ingest succeeded but job record persist failed "
+                f"for {job_id}: {write_exc}"
+            )
         return job
     finally:
         _ingest_in_flight.discard(job_id)

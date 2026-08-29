@@ -5,6 +5,7 @@ import subprocess
 import time
 from pathlib import Path
 
+import httpx
 import pytest
 from fastapi import HTTPException
 from httpx import ASGITransport, AsyncClient
@@ -12,14 +13,18 @@ from PIL import Image
 from starlette.requests import Request
 
 from frontend.main import (
+    JOBS_GCS_PREFIX,
     EnqueueError,
     PersistError,
+    TerminalIngestError,
     _extract_parts,
     drain_pending_ingest_jobs,
     enqueue_ingest_job,
     extract_receipt_fields,
+    list_pending_ingest_jobs,
     load_job,
     persist_uploaded_image,
+    process_ingest_job,
     strip_receipt_marker,
     verify_api_key,
 )
@@ -363,3 +368,192 @@ async def test_ingest_endpoint_runs_one_persisted_job(tmp_path, monkeypatch):
     assert response.json() == {"status": "ok", "completed": [job["job_id"]]}
     assert len(calls) == 1
     assert load_job(job["job_id"])["status"] == "succeeded"
+
+
+class _FakeBlob:
+    def __init__(self, name: str, data: str | None = None):
+        self.name = name
+        self._data = data
+
+    def exists(self) -> bool:
+        return self._data is not None
+
+    def download_as_text(self) -> str:
+        return self._data or ""
+
+    def upload_from_string(self, payload: str, content_type: str | None = None) -> None:
+        self._data = payload
+
+
+class _FakeBucket:
+    def __init__(self) -> None:
+        self.blobs: dict[str, _FakeBlob] = {}
+
+    def blob(self, name: str) -> _FakeBlob:
+        if name not in self.blobs:
+            self.blobs[name] = _FakeBlob(name)
+        return self.blobs[name]
+
+    def list_blobs(self, prefix: str = ""):
+        return [
+            blob
+            for name, blob in self.blobs.items()
+            if name.startswith(prefix) and blob.exists()
+        ]
+
+
+class _FakeGCS:
+    def __init__(self) -> None:
+        self._bucket = _FakeBucket()
+
+    def bucket(self, name: str) -> _FakeBucket:
+        return self._bucket
+
+
+def _job_record(job_id: str, status: str) -> dict:
+    return {
+        "job_id": job_id,
+        "status": status,
+        "image_name": "shot.jpg",
+        "filename": "shot.jpg",
+        "media_type": "image/jpeg",
+        "image_path": "/media/shot.jpg",
+        "subject": "WiFi",
+        "summary": "Saved" if status == "succeeded" else None,
+        "reply": "Saved" if status == "succeeded" else None,
+        "merchant": None,
+        "amount": None,
+        "currency": None,
+        "date": None,
+        "error": None,
+    }
+
+
+@pytest.mark.asyncio
+async def test_transient_ingest_error_stays_pending_and_retries(tmp_path, monkeypatch):
+    monkeypatch.setattr("frontend.main.MEDIA_DIR", str(tmp_path))
+    monkeypatch.setattr("frontend.main.GCS_BUCKET_NAME", None)
+    monkeypatch.setattr("frontend.main.INGEST_DRAIN_INTERVAL_SEC", 0)
+
+    persist_uploaded_image(_jpeg_bytes(), "shot.jpg", "image/jpeg")
+    job = enqueue_ingest_job(
+        "shot.jpg", "shot.jpg", "image/jpeg", "/media/shot.jpg", "WiFi"
+    )
+    attempts = {"n": 0}
+
+    async def flaky_ingest(*args, **kwargs):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise httpx.ConnectError("connection refused")
+        return "stored"
+
+    monkeypatch.setattr("frontend.main.ingest_uploaded_image", flaky_ingest)
+    first = await drain_pending_ingest_jobs()
+    assert first == []
+    assert load_job(job["job_id"])["status"] == "pending"
+
+    second = await drain_pending_ingest_jobs()
+    assert second == [job["job_id"]]
+    assert load_job(job["job_id"])["status"] == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_terminal_ingest_error_marks_job_failed(tmp_path, monkeypatch):
+    monkeypatch.setattr("frontend.main.MEDIA_DIR", str(tmp_path))
+    monkeypatch.setattr("frontend.main.GCS_BUCKET_NAME", None)
+    monkeypatch.setattr("frontend.main.INGEST_DRAIN_INTERVAL_SEC", 0)
+
+    persist_uploaded_image(_jpeg_bytes(), "shot.jpg", "image/jpeg")
+    job = enqueue_ingest_job(
+        "shot.jpg", "shot.jpg", "image/jpeg", "/media/shot.jpg", "WiFi"
+    )
+
+    async def bad_request(*args, **kwargs):
+        request = httpx.Request("POST", "http://127.0.0.1/a2a")
+        response = httpx.Response(400, request=request)
+        raise httpx.HTTPStatusError("bad request", request=request, response=response)
+
+    monkeypatch.setattr("frontend.main.ingest_uploaded_image", bad_request)
+    completed = await drain_pending_ingest_jobs()
+    assert completed == [job["job_id"]]
+    stored = load_job(job["job_id"])
+    assert stored["status"] == "failed"
+    assert stored["error"] == "ingest_failed"
+
+    async def never(*args, **kwargs):
+        raise AssertionError("terminal jobs must not be retried")
+
+    monkeypatch.setattr("frontend.main.ingest_uploaded_image", never)
+    assert await drain_pending_ingest_jobs() == []
+
+
+@pytest.mark.asyncio
+async def test_terminal_ingest_error_class_marks_failed(tmp_path, monkeypatch):
+    monkeypatch.setattr("frontend.main.MEDIA_DIR", str(tmp_path))
+    monkeypatch.setattr("frontend.main.GCS_BUCKET_NAME", None)
+    monkeypatch.setattr("frontend.main.INGEST_DRAIN_INTERVAL_SEC", 0)
+
+    persist_uploaded_image(_jpeg_bytes(), "shot.jpg", "image/jpeg")
+    job = enqueue_ingest_job(
+        "shot.jpg", "shot.jpg", "image/jpeg", "/media/shot.jpg", "WiFi"
+    )
+
+    async def terminal(*args, **kwargs):
+        raise TerminalIngestError("permanent")
+
+    monkeypatch.setattr("frontend.main.ingest_uploaded_image", terminal)
+    await process_ingest_job(job)
+    assert load_job(job["job_id"])["status"] == "failed"
+
+
+def test_gcs_is_source_of_truth_over_stale_local(tmp_path, monkeypatch):
+    monkeypatch.setattr("frontend.main.MEDIA_DIR", str(tmp_path))
+    monkeypatch.setattr("frontend.main.GCS_BUCKET_NAME", "existing-bucket")
+    gcs = _FakeGCS()
+    monkeypatch.setattr("frontend.main._get_gcs_client", lambda: gcs)
+
+    job_id = "11111111-1111-4111-8111-111111111111"
+    local_pending = _job_record(job_id, "pending")
+    (tmp_path / "jobs").mkdir(parents=True)
+    (tmp_path / "jobs" / f"{job_id}.json").write_text(json.dumps(local_pending))
+
+    gcs_succeeded = _job_record(job_id, "succeeded")
+    gcs.bucket("existing-bucket").blob(
+        f"{JOBS_GCS_PREFIX}{job_id}.json"
+    ).upload_from_string(json.dumps(gcs_succeeded))
+
+    loaded = load_job(job_id)
+    assert loaded is not None
+    assert loaded["status"] == "succeeded"
+    assert list_pending_ingest_jobs() == []
+
+
+@pytest.mark.asyncio
+async def test_successful_store_stays_succeeded_if_job_write_fails(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr("frontend.main.MEDIA_DIR", str(tmp_path))
+    monkeypatch.setattr("frontend.main.GCS_BUCKET_NAME", None)
+    monkeypatch.setattr("frontend.main.INGEST_DRAIN_INTERVAL_SEC", 0)
+
+    persist_uploaded_image(_jpeg_bytes(), "shot.jpg", "image/jpeg")
+    job = enqueue_ingest_job(
+        "shot.jpg", "shot.jpg", "image/jpeg", "/media/shot.jpg", "WiFi"
+    )
+
+    async def fake_ingest(*args, **kwargs):
+        return "stored"
+
+    def write_after_success(record):
+        if record.get("status") == "succeeded":
+            raise EnqueueError("durable job write failed")
+        path = tmp_path / "jobs" / f"{record['job_id']}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(record))
+
+    monkeypatch.setattr("frontend.main.ingest_uploaded_image", fake_ingest)
+    monkeypatch.setattr("frontend.main.write_job_record", write_after_success)
+    updated = await process_ingest_job(job)
+    assert updated["status"] == "succeeded"
+    assert updated["summary"] == "stored"
+    assert updated.get("error") is None
