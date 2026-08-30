@@ -95,14 +95,16 @@ agents-cli deploy \
 
 ### Step 4: Verify Live End-to-End Recall
 
-1. Send an image upload from your phone via the Cloud Run proxy:
+1. Send an image upload from your phone via the Cloud Run proxy (send-and-forget; expect `202 Accepted` with `job_id` + `image_path`, not an agent writeup):
    ```bash
    curl -X POST https://visual-memory-vault-proxy-151358874679.us-east1.run.app/upload \
      -H "X-Api-Key: <YOUR_PROXY_KEY>" \
      -F "file=@receipt.jpg" \
      -F "subject=Test Onboarding"
    ```
-2. Verify the memory appears in your `casa.heskew` Flair instance:
+   Cloud Run is HTTP edge only and may scale to zero after `202`. The upload request does not run Gemini/Flair and does not rely on `create_task`. Persist the image, write a durable job (`vault-jobs/` when `GCS_BUCKET_NAME` is set), and enqueue Cloud Tasks to `POST /ingest` on the proxy you already deployed (`INGEST_HANDLER_URL`). That new request talks to Agent Engine. Poll `GET /jobs/{job_id}` for `pending` / `succeeded` / `failed`. Shortcut clients must not call `/ingest`. Local uvicorn may set `INGEST_DRAIN_INTERVAL_SEC` for a dev-only loop.
+
+   2. Verify the memory appears in your `casa.heskew` Flair instance:
    ```bash
    flair memory list --target https://casa.heskew.harperfabric.com
    ```

@@ -12,17 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-output "app_service_account_email" {
-  description = "Application service account email"
-  value       = google_service_account.app_sa.email
-}
+resource "google_cloud_tasks_queue" "ingest" {
+  name     = "${var.project_name}-ingest"
+  location = var.region
+  project  = var.project_id
 
-output "logs_bucket_name" {
-  description = "Logs storage bucket name"
-  value       = google_storage_bucket.logs_data_bucket.name
-}
+  retry_config {
+    max_attempts       = 16
+    min_backoff        = "10s"
+    max_backoff        = "300s"
+    max_doublings      = 4
+    max_retry_duration = "3600s"
+  }
 
-output "ingest_tasks_queue_name" {
-  description = "Cloud Tasks queue id for POST /ingest. Set CLOUD_TASKS_QUEUE to this value."
-  value       = google_cloud_tasks_queue.ingest.name
+  depends_on = [google_project_service.services]
 }

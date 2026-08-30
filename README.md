@@ -41,6 +41,8 @@ flowchart TD
     subgraph Capture["Ingestion Surfaces"]
         Web["Web UI (Chat + Photo Upload)"]
         iOS["Mobile & iOS Shortcuts"]
+        Persist["Image + durable job (GCS / local)"]
+        Tasks["Cloud Tasks → POST /ingest"]
         A2A["Peer Agents (A2A Protocol)"]
     end
 
@@ -56,8 +58,11 @@ flowchart TD
         Vector["Semantic Index & Graph Recall"]
     end
 
-    Web -->|Upload / Chat| Agent
-    iOS -->|POST /upload| Agent
+    Web -->|POST /upload 202 then GET /jobs| Persist
+    Web -->|Chat| Agent
+    iOS -->|POST /upload 202| Persist
+    Persist --> Tasks
+    Tasks --> Agent
     A2A -->|JSON-RPC Stream| Agent
 
     Agent -->|Multimodal Analysis| Gemini
@@ -133,7 +138,7 @@ Open **`http://localhost:8080`** in your browser to start chatting and uploading
 
 ## 📱 Mobile Ingestion (iOS Shortcuts / curl)
 
-Upload photos directly from your phone camera or automated workflow:
+Upload photos directly from your phone camera or automated workflow. This is **send-and-forget**: the proxy persists the image, enqueues a durable ingest job, and returns immediately. Do not wait on a summary or `RECEIPT` line — iOS Shortcuts typically time out around 30s if they do.
 
 ```bash
 curl -X POST http://localhost:8080/upload \
@@ -141,18 +146,16 @@ curl -X POST http://localhost:8080/upload \
   -F "subject=Dinner Receipt"
 ```
 
-Response:
+Response (`202 Accepted`):
 ```json
 {
-  "status": "success",
-  "filename": "receipt.jpg",
-  "summary": "Saved receipt from Joe's Grill: Total $58.40 on Aug 20, 2026. Items: Ribeye, sparkling water.",
-  "merchant": "Joe's Grill",
-  "amount": "58.40",
-  "currency": "USD",
-  "date": "2026-08-20"
+  "status": "accepted",
+  "job_id": "<uuid>",
+  "image_path": "/media/<uuid>_receipt.jpg"
 }
 ```
+
+The in-app web UI uses the same `POST /upload`, then polls `GET /jobs/{job_id}` until extract + `store_memory` finishes and the receipt chip can render. Production ingest is a **new HTTP request** created by Cloud Tasks (`POST /ingest`), not CPU leftover on the upload instance. Local uvicorn can drain jobs when `INGEST_DRAIN_INTERVAL_SEC` is set.
 
 ---
 

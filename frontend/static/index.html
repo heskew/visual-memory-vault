@@ -63,6 +63,7 @@
   <button type="submit">Send</button>
 </form>
 
+<script src="vault-upload.js"></script>
 <script>
 const log = document.getElementById("log");
 const form = document.getElementById("form");
@@ -209,6 +210,18 @@ function renderReply(b, parts) {
 const uploadBtn = document.getElementById("upload-btn");
 const fileInput = document.getElementById("file-input");
 
+function vaultHeaders(extra) {
+  const headers = Object.assign({}, extra || {});
+  const key = new URLSearchParams(location.search).get("key");
+  if (key) headers["X-Api-Key"] = key;
+  return headers;
+}
+function vaultFetch(url, opts) {
+  opts = Object.assign({}, opts || {});
+  opts.headers = vaultHeaders(opts.headers);
+  return fetch(url, opts);
+}
+
 uploadBtn.addEventListener("click", () => fileInput.click());
 
 fileInput.addEventListener("change", async () => {
@@ -217,20 +230,18 @@ fileInput.addEventListener("change", async () => {
   bubble("user").textContent = `[Uploaded Photo: ${file.name}]`;
   const b = bubble("agent"); b.textContent = "Processing image & saving to Flair memory…";
 
-  const formData = new FormData();
-  formData.append("file", file);
-  formData.append("subject", file.name);
-
   try {
-    const res = await fetch("/upload", { method: "POST", body: formData });
-    const raw = await res.text();
-    let data;
-    try { data = JSON.parse(raw); }
-    catch { throw new Error(`Server returned non-JSON (HTTP ${res.status}). ${raw.slice(0, 300)}`); }
+    const accepted = await VaultUpload.uploadPhoto(file, vaultFetch);
+    b.textContent = "Photo saved. Extracting…";
+    const job = await VaultUpload.pollJob(accepted.job_id, vaultFetch);
     b.textContent = "";
-    const chip = receiptChip(data);
+    if (job.status === "failed") {
+      b.textContent = "Saved the photo, but memory ingest failed.";
+      return;
+    }
+    const chip = receiptChip(job);
     if (chip) b.appendChild(chip);
-    b.appendChild(el("div", null, data.reply || data.summary || "Photo saved to Visual Memory!"));
+    b.appendChild(el("div", null, job.reply || job.summary || "Photo saved to Visual Memory!"));
   } catch (e) {
     b.textContent = "Upload Error: " + e.message;
   } finally {
@@ -247,7 +258,7 @@ form.addEventListener("submit", async (ev) => {
   input.value = "";
   const b = bubble("agent"); b.textContent = "…";
   try {
-    const res = await fetch("/chat", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ message: text }) });
+    const res = await vaultFetch("/chat", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ message: text }) });
     const raw = await res.text();
     let data;
     try { data = JSON.parse(raw); }
