@@ -102,7 +102,7 @@ agents-cli deploy \
      -F "file=@receipt.jpg" \
      -F "subject=Test Onboarding"
    ```
-   Cloud Run is HTTP edge only and may scale to zero after `202`. The upload request does not run Gemini/Flair and does not rely on `create_task`. Persist the image and enqueue a durable job record (`vault-jobs/` in the existing GCS bucket when `GCS_BUCKET_NAME` is set; local `MEDIA_DIR/jobs/` for development). A worker (`POST /ingest`, or the process drain loop because jobs exist) talks to Agent Engine. Poll `GET /jobs/{job_id}` for `pending` / `succeeded` / `failed`. Shortcut clients must not call `/ingest`.
+   Cloud Run is HTTP edge only and may scale to zero after `202`. The upload request does not run Gemini/Flair and does not rely on `create_task`. Persist the image, write a durable job (`vault-jobs/` when `GCS_BUCKET_NAME` is set), and enqueue Cloud Tasks to `POST /ingest` on the proxy you already deployed (`INGEST_HANDLER_URL`). That new request talks to Agent Engine. Poll `GET /jobs/{job_id}` for `pending` / `succeeded` / `failed`. Shortcut clients must not call `/ingest`. Local uvicorn may set `INGEST_DRAIN_INTERVAL_SEC` for a dev-only loop.
 
    2. Verify the memory appears in your `casa.heskew` Flair instance:
    ```bash

@@ -42,6 +42,7 @@ flowchart TD
         Web["Web UI (Chat + Photo Upload)"]
         iOS["Mobile & iOS Shortcuts"]
         Persist["Image + durable job (GCS / local)"]
+        Tasks["Cloud Tasks → POST /ingest"]
         A2A["Peer Agents (A2A Protocol)"]
     end
 
@@ -60,7 +61,8 @@ flowchart TD
     Web -->|POST /upload 202 then GET /jobs| Persist
     Web -->|Chat| Agent
     iOS -->|POST /upload 202| Persist
-    Persist -->|worker / POST /ingest| Agent
+    Persist --> Tasks
+    Tasks --> Agent
     A2A -->|JSON-RPC Stream| Agent
 
     Agent -->|Multimodal Analysis| Gemini
@@ -153,7 +155,7 @@ Response (`202 Accepted`):
 }
 ```
 
-The in-app web UI uses the same `POST /upload`, then polls `GET /jobs/{job_id}` until extract + `store_memory` finishes and the receipt chip can render.
+The in-app web UI uses the same `POST /upload`, then polls `GET /jobs/{job_id}` until extract + `store_memory` finishes and the receipt chip can render. Production ingest is a **new HTTP request** created by Cloud Tasks (`POST /ingest`), not CPU leftover on the upload instance. Local uvicorn can drain jobs when `INGEST_DRAIN_INTERVAL_SEC` is set.
 
 ---
 

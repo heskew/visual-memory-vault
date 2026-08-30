@@ -19,9 +19,11 @@ from frontend.main import (
     PersistError,
     TerminalIngestError,
     _extract_parts,
+    claim_ingest_job,
     drain_pending_ingest_jobs,
     enqueue_ingest_job,
     extract_receipt_fields,
+    is_transient_ingest_error,
     list_pending_ingest_jobs,
     load_job,
     persist_uploaded_image,
@@ -121,6 +123,8 @@ def test_index_html_has_three_row_receipt_chip():
     assert "wait=1" not in html
     assert "vault-upload.js" in html
     assert "pollJob" in html
+    assert "function vaultFetch" in html
+    assert 'headers["X-Api-Key"]' in html
 
 
 def test_web_ui_polls_jobs_not_wait_flag():
@@ -131,6 +135,8 @@ def test_web_ui_polls_jobs_not_wait_flag():
     assert 'fetchImpl("/upload"' in js or 'fetchImpl("/upload",' in js
     assert "/jobs/" in js
     assert "pollJob" in js
+    assert "VaultUpload.uploadPhoto(file, vaultFetch)" in html
+    assert "VaultUpload.pollJob(accepted.job_id, vaultFetch)" in html
     result = subprocess.run(
         ["node", "tests/unit/test_vault_upload.js"],
         check=False,
@@ -375,15 +381,33 @@ class _FakeBlob:
     def __init__(self, name: str, data: str | None = None):
         self.name = name
         self._data = data
+        self.generation = 1 if data is not None else 0
 
     def exists(self) -> bool:
         return self._data is not None
 
+    def reload(self) -> None:
+        return None
+
     def download_as_text(self) -> str:
         return self._data or ""
 
-    def upload_from_string(self, payload: str, content_type: str | None = None) -> None:
+    def upload_from_string(
+        self,
+        payload: str,
+        content_type: str | None = None,
+        if_generation_match: int | None = None,
+    ) -> None:
+        if (
+            if_generation_match is not None
+            and self._data is not None
+            and self.generation != if_generation_match
+        ):
+            from google.api_core.exceptions import PreconditionFailed
+
+            raise PreconditionFailed("generation mismatch")
         self._data = payload
+        self.generation += 1
 
 
 class _FakeBucket:
@@ -541,15 +565,21 @@ async def test_successful_store_stays_succeeded_if_job_write_fails(
     job = enqueue_ingest_job(
         "shot.jpg", "shot.jpg", "image/jpeg", "/media/shot.jpg", "WiFi"
     )
+    job_id = job["job_id"]
+    ingest_calls = {"n": 0}
 
     async def fake_ingest(*args, **kwargs):
+        ingest_calls["n"] += 1
         return "stored"
 
+    writes = {"n": 0}
+
     def write_after_success(record):
-        if record.get("status") == "succeeded":
-            raise EnqueueError("durable job write failed")
+        writes["n"] += 1
         path = tmp_path / "jobs" / f"{record['job_id']}.json"
         path.parent.mkdir(parents=True, exist_ok=True)
+        if record.get("status") == "succeeded" and writes["n"] == 1:
+            raise EnqueueError("durable job write failed")
         path.write_text(json.dumps(record))
 
     monkeypatch.setattr("frontend.main.ingest_uploaded_image", fake_ingest)
@@ -558,6 +588,18 @@ async def test_successful_store_stays_succeeded_if_job_write_fails(
     assert updated["status"] == "succeeded"
     assert updated["summary"] == "stored"
     assert updated.get("error") is None
+    durable = json.loads((tmp_path / "jobs" / f"{job_id}.json").read_text())
+    assert durable["status"] != "succeeded"
+    assert (tmp_path / "jobs" / f"{job_id}.stored.json").is_file()
+
+    async def never(*args, **kwargs):
+        raise AssertionError("store_memory must not run again")
+
+    monkeypatch.setattr("frontend.main.ingest_uploaded_image", never)
+    second = await drain_pending_ingest_jobs()
+    assert job_id in second
+    assert ingest_calls["n"] == 1
+    assert load_job(job_id)["status"] == "succeeded"
 
 
 def _a2a_http_error(status_code: int) -> A2AClientError:
@@ -626,3 +668,153 @@ async def test_get_job_falls_back_to_local_cache_when_gcs_read_fails(
     body = response.json()
     assert body["job_id"] == job_id
     assert body["status"] == "pending"
+
+
+def test_programmer_errors_are_terminal_not_retried():
+    assert is_transient_ingest_error(TypeError("bug")) is False
+    assert is_transient_ingest_error(KeyError("missing")) is False
+    assert is_transient_ingest_error(AttributeError("nope")) is False
+    assert is_transient_ingest_error(httpx.ConnectError("refused")) is True
+
+
+def test_enqueue_requires_cloud_tasks_when_gcs_configured(tmp_path, monkeypatch):
+    monkeypatch.setattr("frontend.main.MEDIA_DIR", str(tmp_path))
+    monkeypatch.setattr("frontend.main.GCS_BUCKET_NAME", "existing-bucket")
+    monkeypatch.setattr("frontend.main.CLOUD_TASKS_QUEUE", None)
+    gcs = _FakeGCS()
+    monkeypatch.setattr("frontend.main._get_gcs_client", lambda: gcs)
+    persist_uploaded_image(_jpeg_bytes(), "shot.jpg", "image/jpeg")
+    with pytest.raises(EnqueueError, match="CLOUD_TASKS_QUEUE"):
+        enqueue_ingest_job(
+            "shot.jpg", "shot.jpg", "image/jpeg", "/media/shot.jpg", "WiFi"
+        )
+
+
+def test_enqueue_creates_cloud_task_for_new_ingest_request(tmp_path, monkeypatch):
+    monkeypatch.setattr("frontend.main.MEDIA_DIR", str(tmp_path))
+    monkeypatch.setattr("frontend.main.GCS_BUCKET_NAME", None)
+    monkeypatch.setattr("frontend.main.CLOUD_TASKS_QUEUE", "vault-ingest")
+    created = []
+    monkeypatch.setattr(
+        "frontend.main.create_ingest_cloud_task",
+        lambda job_id: created.append(job_id),
+    )
+    persist_uploaded_image(_jpeg_bytes(), "shot.jpg", "image/jpeg")
+    job = enqueue_ingest_job(
+        "shot.jpg", "shot.jpg", "image/jpeg", "/media/shot.jpg", "WiFi"
+    )
+    assert created == [job["job_id"]]
+    assert load_job(job["job_id"])["status"] == "pending"
+
+
+def test_gcs_list_failure_falls_back_to_local_pending(tmp_path, monkeypatch):
+    monkeypatch.setattr("frontend.main.MEDIA_DIR", str(tmp_path))
+    monkeypatch.setattr("frontend.main.GCS_BUCKET_NAME", "existing-bucket")
+    job_id = "33333333-3333-4333-8333-333333333333"
+    (tmp_path / "jobs").mkdir(parents=True)
+    (tmp_path / "jobs" / f"{job_id}.json").write_text(
+        json.dumps(_job_record(job_id, "pending"))
+    )
+
+    def gcs_boom():
+        raise RuntimeError("GCS list unavailable")
+
+    monkeypatch.setattr("frontend.main._get_gcs_client", gcs_boom)
+    pending = list_pending_ingest_jobs()
+    assert len(pending) == 1
+    assert pending[0]["job_id"] == job_id
+
+
+@pytest.mark.asyncio
+async def test_lease_prevents_two_consumers_from_extracting(tmp_path, monkeypatch):
+    monkeypatch.setattr("frontend.main.MEDIA_DIR", str(tmp_path))
+    monkeypatch.setattr("frontend.main.GCS_BUCKET_NAME", None)
+    monkeypatch.setattr("frontend.main.INGEST_DRAIN_INTERVAL_SEC", 0)
+    persist_uploaded_image(_jpeg_bytes(), "shot.jpg", "image/jpeg")
+    job = enqueue_ingest_job(
+        "shot.jpg", "shot.jpg", "image/jpeg", "/media/shot.jpg", "WiFi"
+    )
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = {"n": 0}
+
+    async def slow_ingest(*args, **kwargs):
+        calls["n"] += 1
+        started.set()
+        await release.wait()
+        return "stored"
+
+    monkeypatch.setattr("frontend.main.ingest_uploaded_image", slow_ingest)
+    first = asyncio.create_task(process_ingest_job(dict(job)))
+    await started.wait()
+    second = await process_ingest_job(dict(job))
+    assert second.get("status") == "running" or calls["n"] == 1
+    assert claim_ingest_job(job["job_id"]) is None
+    release.set()
+    done = await first
+    assert done["status"] == "succeeded"
+    assert calls["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_upload_stays_pending_until_separate_consumer_request(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr("frontend.main.MEDIA_DIR", str(tmp_path))
+    monkeypatch.setattr("frontend.main.GCS_BUCKET_NAME", None)
+    monkeypatch.setattr("frontend.main.INGEST_DRAIN_INTERVAL_SEC", 0)
+    monkeypatch.setattr("frontend.main.CLOUD_TASKS_QUEUE", "vault-ingest")
+    tasks = []
+    monkeypatch.setattr(
+        "frontend.main.create_ingest_cloud_task",
+        lambda job_id: tasks.append(job_id),
+    )
+
+    async def fake_ingest(*args, **kwargs):
+        return (
+            "Saved dinner at Joe's Grill.\n"
+            'RECEIPT: {"merchant":"Joe\'s Grill","amount":"58.40","currency":"USD","date":"2026-08-20"}'
+        )
+
+    monkeypatch.setattr("frontend.main.ingest_uploaded_image", fake_ingest)
+
+    from frontend.main import app
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        uploaded = await client.post(
+            "/upload",
+            files={"file": ("receipt.jpg", _jpeg_bytes(), "image/jpeg")},
+        )
+        assert uploaded.status_code == 202
+        job_id = uploaded.json()["job_id"]
+        assert tasks == [job_id]
+        monkeypatch.setattr("frontend.main._ingest_in_flight", set())
+        pending = await client.get(f"/jobs/{job_id}")
+        assert pending.status_code == 200
+        assert pending.json()["status"] == "pending"
+
+        consumer = await client.post("/ingest", json={"job_id": job_id})
+        assert consumer.status_code == 200
+        assert consumer.json()["completed"] == [job_id]
+        done = await client.get(f"/jobs/{job_id}")
+        assert done.json()["status"] == "succeeded"
+        assert done.json()["merchant"] == "Joe's Grill"
+
+
+@pytest.mark.asyncio
+async def test_gcs_generation_match_blocks_second_claim(tmp_path, monkeypatch):
+    monkeypatch.setattr("frontend.main.MEDIA_DIR", str(tmp_path))
+    monkeypatch.setattr("frontend.main.GCS_BUCKET_NAME", "existing-bucket")
+    monkeypatch.setattr("frontend.main.CLOUD_TASKS_QUEUE", "vault-ingest")
+    monkeypatch.setattr("frontend.main.create_ingest_cloud_task", lambda job_id: None)
+    gcs = _FakeGCS()
+    monkeypatch.setattr("frontend.main._get_gcs_client", lambda: gcs)
+    persist_uploaded_image(_jpeg_bytes(), "shot.jpg", "image/jpeg")
+    job = enqueue_ingest_job(
+        "shot.jpg", "shot.jpg", "image/jpeg", "/media/shot.jpg", "WiFi"
+    )
+    first = claim_ingest_job(job["job_id"])
+    assert first is not None
+    assert first["status"] == "running"
+    assert claim_ingest_job(job["job_id"]) is None

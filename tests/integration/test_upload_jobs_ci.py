@@ -303,6 +303,38 @@ async def test_a2a_429_and_5xx_stay_pending_and_retry(client, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_instance_death_leaves_job_pending_until_consumer(client, monkeypatch):
+    scheduled = []
+    monkeypatch.setattr("frontend.main.CLOUD_TASKS_QUEUE", "vault-ingest")
+    monkeypatch.setattr(
+        "frontend.main.create_ingest_cloud_task",
+        lambda job_id: scheduled.append(job_id),
+    )
+
+    async def succeed(*args, **kwargs):
+        return (
+            "Saved dinner at Joe's Grill.\n"
+            'RECEIPT: {"merchant":"Joe\'s Grill","amount":"58.40","currency":"USD","date":"2026-08-20"}'
+        )
+
+    monkeypatch.setattr("frontend.main.ingest_uploaded_image", succeed)
+    uploaded = await _upload(client, "death.jpg")
+    assert uploaded.status_code == 202
+    job_id = uploaded.json()["job_id"]
+    assert scheduled == [job_id]
+    monkeypatch.setattr("frontend.main._ingest_in_flight", set())
+    pending = await client.get(f"/jobs/{job_id}")
+    assert pending.status_code == 200
+    assert pending.json()["status"] == "pending"
+
+    consumer = await client.post("/ingest", json={"job_id": job_id})
+    assert consumer.status_code == 200
+    assert consumer.json()["completed"] == [job_id]
+    done = await client.get(f"/jobs/{job_id}")
+    assert done.json()["status"] == "succeeded"
+
+
+@pytest.mark.asyncio
 async def test_get_jobs_uses_local_cache_when_gcs_read_throws(
     proxy_env, client, monkeypatch
 ):
@@ -328,8 +360,9 @@ async def test_web_client_uploads_then_polls_jobs_no_wait_flag(proxy_env, monkey
     js = Path("frontend/static/vault-upload.js").read_text()
     assert "wait=1" not in html
     assert "wait=1" not in js
-    assert "VaultUpload.uploadPhoto" in html
-    assert "VaultUpload.pollJob(accepted.job_id" in html
+    assert "VaultUpload.uploadPhoto(file, vaultFetch)" in html
+    assert "VaultUpload.pollJob(accepted.job_id, vaultFetch)" in html
+    assert 'headers["X-Api-Key"]' in html
     assert 'fetchImpl("/jobs/"' in js or 'fetchImpl("/jobs/" +' in js
 
     async def succeed(*args, **kwargs):

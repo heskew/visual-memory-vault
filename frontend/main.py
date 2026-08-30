@@ -5,6 +5,8 @@ import io
 import json
 import os
 import re
+import threading
+import time
 import uuid
 from contextlib import asynccontextmanager, suppress
 from typing import Annotated
@@ -58,7 +60,20 @@ GCS_BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME")
 MEDIA_DIR = os.path.abspath(os.environ.get("MEDIA_DIR", "./media"))
 JOBS_DIR_NAME = "jobs"
 JOBS_GCS_PREFIX = "vault-jobs/"
-INGEST_DRAIN_INTERVAL_SEC = float(os.environ.get("INGEST_DRAIN_INTERVAL_SEC", "15"))
+# Production worker is Cloud Tasks → POST /ingest. The lifespan loop is local
+# uvicorn only; default 0 so Cloud Run does not pretend CPU-after-response is a worker.
+INGEST_DRAIN_INTERVAL_SEC = float(os.environ.get("INGEST_DRAIN_INTERVAL_SEC", "0"))
+CLOUD_TASKS_QUEUE = os.environ.get("CLOUD_TASKS_QUEUE")
+CLOUD_TASKS_LOCATION = os.environ.get("CLOUD_TASKS_LOCATION") or os.environ.get(
+    "GOOGLE_CLOUD_LOCATION"
+)
+CLOUD_TASKS_PROJECT = os.environ.get("CLOUD_TASKS_PROJECT") or os.environ.get(
+    "GOOGLE_CLOUD_PROJECT"
+)
+# Operator-provided Cloud Run / proxy base. Never invent a hosted URL.
+INGEST_HANDLER_URL = os.environ.get("INGEST_HANDLER_URL")
+INGEST_TASKS_OIDC_SA = os.environ.get("INGEST_TASKS_OIDC_SA")
+INGEST_LEASE_SEC = float(os.environ.get("INGEST_LEASE_SEC", "120"))
 
 if "A2A_BASE_URL" in os.environ:
     A2A_BASE = os.environ["A2A_BASE_URL"]
@@ -153,10 +168,16 @@ def _auth_headers() -> dict[str, str]:
 
 _ingest_tasks: set[asyncio.Task] = set()
 _ingest_in_flight: set[str] = set()
+_job_write_lock = threading.Lock()
+_tasks_client = None
 
 
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
+    """No production worker here. Cloud Tasks allocates CPU for POST /ingest."""
+    if CLOUD_TASKS_QUEUE or INGEST_DRAIN_INTERVAL_SEC <= 0:
+        yield
+        return
     worker = asyncio.create_task(_run_ingest_drain_worker())
     _ingest_tasks.add(worker)
     try:
@@ -321,8 +342,12 @@ def _http_status_from_ingest_exc(exc: BaseException) -> int | None:
 
 
 def is_transient_ingest_error(exc: BaseException) -> bool:
-    """A2A/Flair timeouts and 5xx/429 stay pending; 4xx and TerminalIngestError fail."""
+    """A2A/Flair timeouts and 5xx/429 stay pending; 4xx and programmer errors fail."""
     if isinstance(exc, TerminalIngestError):
+        return False
+    if isinstance(
+        exc, (TypeError, KeyError, AttributeError, AssertionError, NameError)
+    ):
         return False
     if isinstance(exc, (TransientIngestError, A2AClientTimeoutError)):
         return True
@@ -333,7 +358,9 @@ def is_transient_ingest_error(exc: BaseException) -> bool:
         exc, (httpx.TimeoutException, httpx.NetworkError, httpx.RequestError)
     ):
         return True
-    return True
+    if isinstance(exc, A2AClientError):
+        return True
+    return False
 
 
 def persist_uploaded_image(file_bytes: bytes, image_name: str, media_type: str) -> str:
@@ -382,8 +409,16 @@ def _job_local_path(job_id: str) -> str:
     return os.path.join(MEDIA_DIR, JOBS_DIR_NAME, f"{job_id}.json")
 
 
+def _store_commit_path(job_id: str) -> str:
+    return os.path.join(MEDIA_DIR, JOBS_DIR_NAME, f"{job_id}.stored.json")
+
+
 def _job_gcs_name(job_id: str) -> str:
     return f"{JOBS_GCS_PREFIX}{job_id}.json"
+
+
+def _is_job_json_name(name: str) -> bool:
+    return name.endswith(".json") and not name.endswith(".stored.json")
 
 
 def _decode_job_payload(raw: str | bytes) -> dict | None:
@@ -496,7 +531,166 @@ def enqueue_ingest_job(
         "error": None,
     }
     write_job_record(job)
+    schedule_ingest_consumer(job["job_id"])
     return job
+
+
+def _get_tasks_client():
+    global _tasks_client
+    if _tasks_client is None:
+        from google.cloud import tasks_v2
+
+        _tasks_client = tasks_v2.CloudTasksClient()
+    return _tasks_client
+
+
+def create_ingest_cloud_task(job_id: str) -> None:
+    """Enqueue POST /ingest as a new HTTP request. Does not invent a handler URL."""
+    if not INGEST_HANDLER_URL:
+        raise EnqueueError("INGEST_HANDLER_URL is required to enqueue ingest")
+    if not CLOUD_TASKS_PROJECT or not CLOUD_TASKS_LOCATION:
+        raise EnqueueError("CLOUD_TASKS_PROJECT and CLOUD_TASKS_LOCATION are required")
+    try:
+        from google.cloud import tasks_v2
+
+        client = _get_tasks_client()
+        parent = client.queue_path(
+            CLOUD_TASKS_PROJECT, CLOUD_TASKS_LOCATION, CLOUD_TASKS_QUEUE
+        )
+        url = INGEST_HANDLER_URL.rstrip("/") + "/ingest"
+        headers = {"Content-Type": "application/json"}
+        if API_KEY:
+            headers["X-Api-Key"] = API_KEY
+        http_request = {
+            "http_method": tasks_v2.HttpMethod.POST,
+            "url": url,
+            "headers": headers,
+            "body": json.dumps({"job_id": job_id}).encode(),
+        }
+        if INGEST_TASKS_OIDC_SA:
+            http_request["oidc_token"] = {
+                "service_account_email": INGEST_TASKS_OIDC_SA,
+                "audience": INGEST_HANDLER_URL.rstrip("/"),
+            }
+        client.create_task(
+            request={"parent": parent, "task": {"http_request": http_request}}
+        )
+    except EnqueueError:
+        raise
+    except Exception as exc:
+        raise EnqueueError("cloud tasks enqueue failed") from exc
+
+
+def schedule_ingest_consumer(job_id: str) -> None:
+    """Allocate CPU for ingest via Cloud Tasks. Local/dev has no queue."""
+    if CLOUD_TASKS_QUEUE:
+        create_ingest_cloud_task(job_id)
+        return
+    if GCS_BUCKET_NAME:
+        raise EnqueueError("CLOUD_TASKS_QUEUE is required when GCS_BUCKET_NAME is set")
+
+
+def _write_store_commit(job: dict) -> None:
+    """Local already-stored mark. Drain retries the job write, not extract/store."""
+    try:
+        os.makedirs(os.path.join(MEDIA_DIR, JOBS_DIR_NAME), exist_ok=True)
+        with open(_store_commit_path(job["job_id"]), "w") as f:
+            f.write(json.dumps(job))
+    except Exception as e:
+        print(f"Warning: Failed to write store-commit mark: {e}")
+
+
+def _load_store_commit(job_id: str) -> dict | None:
+    path = _store_commit_path(job_id)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path) as f:
+            return _decode_job_payload(f.read())
+    except Exception as e:
+        print(f"Warning: Failed to read store-commit mark: {e}")
+        return None
+
+
+def _lease_expired(job: dict) -> bool:
+    until = job.get("lease_until")
+    if until is None:
+        return True
+    try:
+        return time.time() >= float(until)
+    except (TypeError, ValueError):
+        return True
+
+
+def _prepare_running_lease(job: dict) -> dict:
+    claimed = dict(job)
+    claimed["status"] = "running"
+    claimed["lease_id"] = str(uuid.uuid4())
+    claimed["lease_until"] = time.time() + INGEST_LEASE_SEC
+    return claimed
+
+
+def _claim_local_job(job_id: str) -> dict | None:
+    current = _load_local_job(job_id)
+    if not current:
+        return None
+    status = current.get("status")
+    if status in {"succeeded", "failed"}:
+        return None
+    if status == "running" and not _lease_expired(current):
+        return None
+    if status not in {"pending", "running"}:
+        return None
+    claimed = _prepare_running_lease(current)
+    _write_local_job_cache(claimed)
+    return claimed
+
+
+def _claim_gcs_job(job_id: str) -> dict | None:
+    from google.api_core import exceptions as gcs_exceptions
+
+    try:
+        gcs = _get_gcs_client()
+        if not gcs:
+            return None
+        blob = gcs.bucket(GCS_BUCKET_NAME).blob(_job_gcs_name(job_id))
+        if not blob.exists():
+            return None
+        blob.reload()
+        current = _decode_job_payload(blob.download_as_text())
+        if not current:
+            return None
+        status = current.get("status")
+        if status in {"succeeded", "failed"}:
+            return None
+        if status == "running" and not _lease_expired(current):
+            return None
+        if status not in {"pending", "running"}:
+            return None
+        claimed = _prepare_running_lease(current)
+        generation = blob.generation
+        blob.upload_from_string(
+            json.dumps(claimed),
+            content_type="application/json",
+            if_generation_match=generation,
+        )
+        _write_local_job_cache(claimed)
+        return claimed
+    except gcs_exceptions.PreconditionFailed:
+        return None
+    except Exception as e:
+        print(f"Warning: Failed to claim GCS job {job_id}: {e}")
+        return None
+
+
+def claim_ingest_job(job_id: str) -> dict | None:
+    """pending→running (or expired running) with CAS / generation match."""
+    if job_id in _ingest_in_flight:
+        return None
+    if GCS_BUCKET_NAME:
+        return _claim_gcs_job(job_id)
+    with _job_write_lock:
+        return _claim_local_job(job_id)
 
 
 def load_uploaded_image_bytes(image_name: str) -> bytes | None:
@@ -526,20 +720,26 @@ def list_pending_ingest_jobs() -> list[dict]:
             if gcs:
                 bucket = gcs.bucket(GCS_BUCKET_NAME)
                 for blob in bucket.list_blobs(prefix=JOBS_GCS_PREFIX):
-                    if not blob.name.endswith(".json"):
+                    if not _is_job_json_name(blob.name.rsplit("/", 1)[-1]):
                         continue
                     job = _decode_job_payload(blob.download_as_text())
                     if job and job.get("status") == "pending":
                         seen[job["job_id"]] = job
         except Exception as e:
             print(f"Warning: Failed to list GCS ingest jobs: {e}")
+            return _list_local_pending_jobs()
         return list(seen.values())
 
+    return _list_local_pending_jobs()
+
+
+def _list_local_pending_jobs() -> list[dict]:
+    seen: dict[str, dict] = {}
     jobs_dir = os.path.join(MEDIA_DIR, JOBS_DIR_NAME)
     try:
         os.makedirs(jobs_dir, exist_ok=True)
         for name in os.listdir(jobs_dir):
-            if not name.endswith(".json"):
+            if not _is_job_json_name(name):
                 continue
             try:
                 with open(os.path.join(jobs_dir, name)) as f:
@@ -555,9 +755,12 @@ def list_pending_ingest_jobs() -> list[dict]:
 
 
 def job_public_view(job: dict) -> dict:
+    status = job["status"]
+    if status == "running":
+        status = "pending"
     view = {
         "job_id": job["job_id"],
-        "status": job["status"],
+        "status": status,
         "image_path": job.get("image_path"),
     }
     if job.get("status") == "succeeded":
@@ -578,50 +781,88 @@ def _mark_job_failed(job: dict, error: str) -> dict:
     return job
 
 
+async def _commit_succeeded_job(job: dict) -> dict:
+    """Persist a successful store. Retry this write, never extract/store again."""
+    job["status"] = "succeeded"
+    job["error"] = None
+    job["store_committed"] = True
+    _write_store_commit(job)
+    try:
+        write_job_record(job)
+    except EnqueueError as write_exc:
+        print(
+            f"Warning: ingest succeeded but job record persist failed "
+            f"for {job['job_id']}: {write_exc}"
+        )
+    return job
+
+
 async def process_ingest_job(job: dict) -> dict:
     """Run extract+store for one persisted job. Updates the durable record."""
     job_id = job["job_id"]
+    committed = _load_store_commit(job_id)
+    if committed and committed.get("store_committed"):
+        return await _commit_succeeded_job(committed)
     if job_id in _ingest_in_flight:
         return job
+    claimed = claim_ingest_job(job_id)
+    if claimed is None:
+        return load_job(job_id) or job
     _ingest_in_flight.add(job_id)
     try:
-        data = load_uploaded_image_bytes(job["image_name"])
+        data = load_uploaded_image_bytes(claimed["image_name"])
         if not data:
-            return _mark_job_failed(job, "image_missing")
+            return _mark_job_failed(claimed, "image_missing")
         try:
             reply_text = await ingest_uploaded_image(
                 data,
-                job["filename"],
-                job["media_type"],
-                job.get("image_path") or job.get("protected_url"),
-                job.get("subject"),
+                claimed["filename"],
+                claimed["media_type"],
+                claimed.get("image_path") or claimed.get("protected_url"),
+                claimed.get("subject"),
             )
         except Exception as exc:
             if is_transient_ingest_error(exc):
                 print(f"Warning: transient ingest error for {job_id}: {exc}")
-                return job
+                claimed["status"] = "pending"
+                claimed["lease_id"] = None
+                claimed["lease_until"] = None
+                try:
+                    write_job_record(claimed)
+                except EnqueueError as write_exc:
+                    print(f"Warning: failed to release lease for {job_id}: {write_exc}")
+                return claimed
             print(f"Error: ingest job {job_id} failed: {exc}")
-            return _mark_job_failed(job, "ingest_failed")
+            return _mark_job_failed(claimed, "ingest_failed")
         fields = _receipt_response_fields(reply_text)
-        job["status"] = "succeeded"
-        job["error"] = None
-        job.update(fields)
-        try:
-            write_job_record(job)
-        except EnqueueError as write_exc:
-            print(
-                f"Warning: ingest succeeded but job record persist failed "
-                f"for {job_id}: {write_exc}"
-            )
-        return job
+        claimed.update(fields)
+        return await _commit_succeeded_job(claimed)
     finally:
         _ingest_in_flight.discard(job_id)
 
 
+def _list_store_commit_jobs() -> list[dict]:
+    jobs: list[dict] = []
+    jobs_dir = os.path.join(MEDIA_DIR, JOBS_DIR_NAME)
+    if not os.path.isdir(jobs_dir):
+        return jobs
+    for name in os.listdir(jobs_dir):
+        if not name.endswith(".stored.json"):
+            continue
+        job_id = name[: -len(".stored.json")]
+        mark = _load_store_commit(job_id)
+        if mark and mark.get("store_committed"):
+            jobs.append(mark)
+    return jobs
+
+
 async def drain_pending_ingest_jobs(limit: int | None = None) -> list[str]:
-    """Process pending jobs because they exist in the durable store."""
+    """Process pending jobs and retry store-commits. Cloud Tasks is the prod trigger."""
     completed: list[str] = []
-    jobs = list_pending_ingest_jobs()
+    by_id = {job["job_id"]: job for job in list_pending_ingest_jobs()}
+    for mark in _list_store_commit_jobs():
+        by_id.setdefault(mark["job_id"], mark)
+    jobs = list(by_id.values())
     if limit is not None:
         jobs = jobs[:limit]
     for job in jobs:
@@ -632,7 +873,7 @@ async def drain_pending_ingest_jobs(limit: int | None = None) -> list[str]:
 
 
 async def _run_ingest_drain_worker() -> None:
-    """Consumer loop. Durability is the job record, not this task."""
+    """Local uvicorn only. Production ingest is Cloud Tasks → POST /ingest."""
     interval = INGEST_DRAIN_INTERVAL_SEC
     if interval <= 0:
         return
@@ -811,8 +1052,30 @@ async def health():
 async def ingest_pending(
     req: Request, x_api_key: Annotated[str | None, Header()] = None
 ):
-    """Worker: process one pending job because it exists. Shortcut clients must not call this."""
+    """Cloud Tasks / worker target. Shortcut clients must not call this."""
     verify_api_key(req, x_api_key)
+    payload: dict = {}
+    try:
+        body = await req.json()
+        if isinstance(body, dict):
+            payload = body
+    except Exception:
+        payload = {}
+    job_id = payload.get("job_id")
+    if job_id:
+        parsed = parse_job_id(str(job_id))
+        job = load_job(parsed)
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+        if job.get("status") in {"succeeded", "failed"}:
+            return JSONResponse({"status": "ok", "completed": [parsed]})
+        updated = await process_ingest_job(job)
+        if updated.get("status") in {"succeeded", "failed"}:
+            return JSONResponse({"status": "ok", "completed": [updated["job_id"]]})
+        return JSONResponse(
+            {"status": "retry", "completed": []},
+            status_code=503,
+        )
     completed = await drain_pending_ingest_jobs(limit=1)
     return JSONResponse({"status": "ok", "completed": completed})
 
