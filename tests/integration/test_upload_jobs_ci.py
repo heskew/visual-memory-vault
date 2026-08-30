@@ -335,6 +335,32 @@ async def test_instance_death_leaves_job_pending_until_consumer(client, monkeypa
 
 
 @pytest.mark.asyncio
+async def test_ingest_503_until_durable_success_write(client, monkeypatch, proxy_env):
+    from frontend.main import write_job_record as real_write
+
+    writes = {"n": 0}
+
+    def flaky_write(record):
+        if record.get("status") == "succeeded" and writes["n"] == 0:
+            writes["n"] += 1
+            raise EnqueueError("durable job write failed")
+        return real_write(record)
+
+    async def succeed(*args, **kwargs):
+        return "stored"
+
+    monkeypatch.setattr("frontend.main.ingest_uploaded_image", succeed)
+    monkeypatch.setattr("frontend.main.write_job_record", flaky_write)
+    job_id = (await _upload(client, "commit.jpg")).json()["job_id"]
+    first = await client.post("/ingest", json={"job_id": job_id})
+    assert first.status_code == 503
+    assert (await client.get(f"/jobs/{job_id}")).json()["status"] == "succeeded"
+    second = await client.post("/ingest", json={"job_id": job_id})
+    assert second.status_code == 200
+    assert (await client.get(f"/jobs/{job_id}")).json()["status"] == "succeeded"
+
+
+@pytest.mark.asyncio
 async def test_get_jobs_uses_local_cache_when_gcs_read_throws(
     proxy_env, client, monkeypatch
 ):

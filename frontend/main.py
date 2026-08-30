@@ -417,8 +417,41 @@ def _job_gcs_name(job_id: str) -> str:
     return f"{JOBS_GCS_PREFIX}{job_id}.json"
 
 
+def _store_commit_gcs_name(job_id: str) -> str:
+    return f"{JOBS_GCS_PREFIX}{job_id}.stored.json"
+
+
 def _is_job_json_name(name: str) -> bool:
     return name.endswith(".json") and not name.endswith(".stored.json")
+
+
+def _is_drainable(job: dict | None) -> bool:
+    if not job:
+        return False
+    status = job.get("status")
+    if status == "pending":
+        return True
+    return status == "running" and _lease_expired(job)
+
+
+def _write_is_stale(current: dict, incoming: dict) -> bool:
+    """A stale worker must not replace a newer lease or a terminal status."""
+    cur_status = current.get("status")
+    new_status = incoming.get("status")
+    if cur_status == "succeeded" and new_status != "succeeded":
+        return True
+    if cur_status == "failed" and new_status not in {"failed", "succeeded"}:
+        return True
+    cur_lease = current.get("lease_id")
+    new_lease = incoming.get("lease_id")
+    if (
+        cur_status == "running"
+        and cur_lease
+        and cur_lease != new_lease
+        and not _lease_expired(current)
+    ):
+        return True
+    return False
 
 
 def _decode_job_payload(raw: str | bytes) -> dict | None:
@@ -433,32 +466,56 @@ def _decode_job_payload(raw: str | bytes) -> dict | None:
 
 
 def write_job_record(job: dict) -> None:
-    """Persist a job record. GCS is required when configured; else local jobs/."""
+    """Persist a job record with generation match. GCS is required when configured."""
+    from google.api_core import exceptions as gcs_exceptions
+
     payload = json.dumps(job)
     job_id = job["job_id"]
     local_ok = False
     gcs_ok = False
-
-    try:
-        os.makedirs(os.path.join(MEDIA_DIR, JOBS_DIR_NAME), exist_ok=True)
-        with open(_job_local_path(job_id), "w") as f:
-            f.write(payload)
-        local_ok = True
-    except Exception as e:
-        print(f"Warning: Failed to write local job record: {e}")
 
     if GCS_BUCKET_NAME:
         try:
             gcs = _get_gcs_client()
             if gcs:
                 blob = gcs.bucket(GCS_BUCKET_NAME).blob(_job_gcs_name(job_id))
-                blob.upload_from_string(payload, content_type="application/json")
+                generation = 0
+                if blob.exists():
+                    blob.reload()
+                    current = _decode_job_payload(blob.download_as_text())
+                    if current and _write_is_stale(current, job):
+                        raise EnqueueError("stale job write")
+                    generation = blob.generation
+                blob.upload_from_string(
+                    payload,
+                    content_type="application/json",
+                    if_generation_match=generation,
+                )
                 gcs_ok = True
+        except EnqueueError:
+            raise
+        except gcs_exceptions.PreconditionFailed as exc:
+            raise EnqueueError("stale job write") from exc
         except Exception as e:
             print(f"Warning: Failed to write GCS job record: {e}")
         if not gcs_ok:
             raise EnqueueError("durable job enqueue failed")
+        _write_local_job_cache(job)
         return
+
+    try:
+        os.makedirs(os.path.join(MEDIA_DIR, JOBS_DIR_NAME), exist_ok=True)
+        with _job_write_lock:
+            current = _load_local_job(job_id)
+            if current and _write_is_stale(current, job):
+                raise EnqueueError("stale job write")
+            with open(_job_local_path(job_id), "w") as f:
+                f.write(payload)
+        local_ok = True
+    except EnqueueError:
+        raise
+    except Exception as e:
+        print(f"Warning: Failed to write local job record: {e}")
 
     if not local_ok:
         raise EnqueueError("local job enqueue failed")
@@ -485,8 +542,8 @@ def _load_local_job(job_id: str) -> dict | None:
     return None
 
 
-def load_job(job_id: str) -> dict | None:
-    """Load a job. GCS is source of truth when readable; local cache on GCS errors."""
+def _load_job_record(job_id: str) -> dict | None:
+    """Raw job JSON. GCS is source of truth when readable; local cache on GCS errors."""
     if GCS_BUCKET_NAME:
         try:
             gcs = _get_gcs_client()
@@ -504,6 +561,21 @@ def load_job(job_id: str) -> dict | None:
         return None
 
     return _load_local_job(job_id)
+
+
+def load_job(job_id: str) -> dict | None:
+    """Load a job. A durable store-commit wins over a still-pending/running record."""
+    record = _load_job_record(job_id)
+    mark = _load_store_commit(job_id)
+    if mark and mark.get("store_committed"):
+        if not record or record.get("status") != "succeeded":
+            return mark
+    return record
+
+
+def _durable_job_terminal(job_id: str) -> bool:
+    record = _load_job_record(job_id)
+    return bool(record and record.get("status") in {"succeeded", "failed"})
 
 
 def enqueue_ingest_job(
@@ -590,17 +662,69 @@ def schedule_ingest_consumer(job_id: str) -> None:
         raise EnqueueError("CLOUD_TASKS_QUEUE is required when GCS_BUCKET_NAME is set")
 
 
-def _write_store_commit(job: dict) -> None:
-    """Local already-stored mark. Drain retries the job write, not extract/store."""
+def _write_local_store_commit(job: dict) -> None:
     try:
         os.makedirs(os.path.join(MEDIA_DIR, JOBS_DIR_NAME), exist_ok=True)
         with open(_store_commit_path(job["job_id"]), "w") as f:
             f.write(json.dumps(job))
     except Exception as e:
-        print(f"Warning: Failed to write store-commit mark: {e}")
+        print(f"Warning: Failed to write local store-commit mark: {e}")
+
+
+def _write_store_commit(job: dict) -> None:
+    """Durable already-stored mark (GCS when configured) with generation match."""
+    from google.api_core import exceptions as gcs_exceptions
+
+    payload = json.dumps(job)
+    job_id = job["job_id"]
+    _write_local_store_commit(job)
+    if not GCS_BUCKET_NAME:
+        if not os.path.exists(_store_commit_path(job_id)):
+            raise EnqueueError("local store-commit failed")
+        return
+
+    try:
+        gcs = _get_gcs_client()
+        if not gcs:
+            raise EnqueueError("durable store-commit failed")
+        blob = gcs.bucket(GCS_BUCKET_NAME).blob(_store_commit_gcs_name(job_id))
+        generation = 0
+        if blob.exists():
+            blob.reload()
+            generation = blob.generation
+        blob.upload_from_string(
+            payload,
+            content_type="application/json",
+            if_generation_match=generation,
+        )
+    except EnqueueError:
+        raise
+    except gcs_exceptions.PreconditionFailed as exc:
+        raise EnqueueError("stale store-commit write") from exc
+    except Exception as exc:
+        raise EnqueueError("durable store-commit failed") from exc
 
 
 def _load_store_commit(job_id: str) -> dict | None:
+    if GCS_BUCKET_NAME:
+        try:
+            gcs = _get_gcs_client()
+            if gcs:
+                blob = gcs.bucket(GCS_BUCKET_NAME).blob(_store_commit_gcs_name(job_id))
+                if blob.exists():
+                    mark = _decode_job_payload(blob.download_as_text())
+                    if mark:
+                        _write_local_store_commit(mark)
+                    return mark
+                return None
+        except Exception as e:
+            print(f"Warning: Failed to read GCS store-commit: {e}")
+            return _load_local_store_commit(job_id)
+        return None
+    return _load_local_store_commit(job_id)
+
+
+def _load_local_store_commit(job_id: str) -> dict | None:
     path = _store_commit_path(job_id)
     if not os.path.exists(path):
         return None
@@ -723,7 +847,7 @@ def list_pending_ingest_jobs() -> list[dict]:
                     if not _is_job_json_name(blob.name.rsplit("/", 1)[-1]):
                         continue
                     job = _decode_job_payload(blob.download_as_text())
-                    if job and job.get("status") == "pending":
+                    if _is_drainable(job):
                         seen[job["job_id"]] = job
         except Exception as e:
             print(f"Warning: Failed to list GCS ingest jobs: {e}")
@@ -747,7 +871,7 @@ def _list_local_pending_jobs() -> list[dict]:
             except Exception as e:
                 print(f"Warning: Failed to read local job {name}: {e}")
                 continue
-            if job and job.get("status") == "pending":
+            if _is_drainable(job):
                 seen[job["job_id"]] = job
     except Exception as e:
         print(f"Warning: Failed to list local ingest jobs: {e}")
@@ -782,13 +906,19 @@ def _mark_job_failed(job: dict, error: str) -> dict:
 
 
 async def _commit_succeeded_job(job: dict) -> dict:
-    """Persist a successful store. Retry this write, never extract/store again."""
+    """Persist store-commit then the job. Retry the job write, never extract/store."""
     job["status"] = "succeeded"
     job["error"] = None
     job["store_committed"] = True
-    _write_store_commit(job)
+    job["_durable_written"] = False
+    try:
+        _write_store_commit(job)
+    except EnqueueError as write_exc:
+        print(f"Warning: durable store-commit failed for {job['job_id']}: {write_exc}")
+        return job
     try:
         write_job_record(job)
+        job["_durable_written"] = True
     except EnqueueError as write_exc:
         print(
             f"Warning: ingest succeeded but job record persist failed "
@@ -825,7 +955,6 @@ async def process_ingest_job(job: dict) -> dict:
             if is_transient_ingest_error(exc):
                 print(f"Warning: transient ingest error for {job_id}: {exc}")
                 claimed["status"] = "pending"
-                claimed["lease_id"] = None
                 claimed["lease_until"] = None
                 try:
                     write_job_record(claimed)
@@ -843,21 +972,39 @@ async def process_ingest_job(job: dict) -> dict:
 
 def _list_store_commit_jobs() -> list[dict]:
     jobs: list[dict] = []
+    seen: set[str] = set()
+    if GCS_BUCKET_NAME:
+        try:
+            gcs = _get_gcs_client()
+            if gcs:
+                for blob in gcs.bucket(GCS_BUCKET_NAME).list_blobs(
+                    prefix=JOBS_GCS_PREFIX
+                ):
+                    name = blob.name.rsplit("/", 1)[-1]
+                    if not name.endswith(".stored.json"):
+                        continue
+                    mark = _decode_job_payload(blob.download_as_text())
+                    if mark and mark.get("store_committed"):
+                        jobs.append(mark)
+                        seen.add(mark["job_id"])
+        except Exception as e:
+            print(f"Warning: Failed to list GCS store-commits: {e}")
     jobs_dir = os.path.join(MEDIA_DIR, JOBS_DIR_NAME)
-    if not os.path.isdir(jobs_dir):
-        return jobs
-    for name in os.listdir(jobs_dir):
-        if not name.endswith(".stored.json"):
-            continue
-        job_id = name[: -len(".stored.json")]
-        mark = _load_store_commit(job_id)
-        if mark and mark.get("store_committed"):
-            jobs.append(mark)
+    if os.path.isdir(jobs_dir):
+        for name in os.listdir(jobs_dir):
+            if not name.endswith(".stored.json"):
+                continue
+            job_id = name[: -len(".stored.json")]
+            if job_id in seen:
+                continue
+            mark = _load_local_store_commit(job_id)
+            if mark and mark.get("store_committed"):
+                jobs.append(mark)
     return jobs
 
 
 async def drain_pending_ingest_jobs(limit: int | None = None) -> list[str]:
-    """Process pending jobs and retry store-commits. Cloud Tasks is the prod trigger."""
+    """Process pending/expired-running jobs and retry store-commits."""
     completed: list[str] = []
     by_id = {job["job_id"]: job for job in list_pending_ingest_jobs()}
     for mark in _list_store_commit_jobs():
@@ -867,8 +1014,9 @@ async def drain_pending_ingest_jobs(limit: int | None = None) -> list[str]:
         jobs = jobs[:limit]
     for job in jobs:
         updated = await process_ingest_job(job)
-        if updated.get("status") in {"succeeded", "failed"}:
-            completed.append(updated["job_id"])
+        job_id = updated["job_id"]
+        if _durable_job_terminal(job_id):
+            completed.append(job_id)
     return completed
 
 
@@ -1064,19 +1212,30 @@ async def ingest_pending(
     job_id = payload.get("job_id")
     if job_id:
         parsed = parse_job_id(str(job_id))
-        job = load_job(parsed)
-        if not job:
+        record = _load_job_record(parsed)
+        mark = _load_store_commit(parsed)
+        if not record and not mark:
             raise HTTPException(status_code=404, detail="Job not found")
-        if job.get("status") in {"succeeded", "failed"}:
+        if _durable_job_terminal(parsed):
             return JSONResponse({"status": "ok", "completed": [parsed]})
-        updated = await process_ingest_job(job)
-        if updated.get("status") in {"succeeded", "failed"}:
-            return JSONResponse({"status": "ok", "completed": [updated["job_id"]]})
+        job = record or mark
+        await process_ingest_job(job)
+        if _durable_job_terminal(parsed):
+            return JSONResponse({"status": "ok", "completed": [parsed]})
         return JSONResponse(
             {"status": "retry", "completed": []},
             status_code=503,
         )
     completed = await drain_pending_ingest_jobs(limit=1)
+    if completed:
+        return JSONResponse({"status": "ok", "completed": completed})
+    record_ids = [
+        job["job_id"]
+        for job in list_pending_ingest_jobs()
+        if _load_store_commit(job["job_id"])
+    ]
+    if record_ids or _list_store_commit_jobs():
+        return JSONResponse({"status": "retry", "completed": []}, status_code=503)
     return JSONResponse({"status": "ok", "completed": completed})
 
 
