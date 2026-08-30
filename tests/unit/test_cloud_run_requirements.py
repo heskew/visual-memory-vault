@@ -32,17 +32,23 @@ def _pyproject_deps() -> list[str]:
 def _requirements_lines() -> list[str]:
     return [
         line.strip()
-        for line in (REPO_ROOT / "frontend" / "requirements.txt").read_text().splitlines()
+        for line in (REPO_ROOT / "frontend" / "requirements.txt")
+        .read_text()
+        .splitlines()
         if line.strip() and not line.strip().startswith("#")
     ]
 
 
 def test_frontend_requirements_pins_google_cloud_tasks_like_pyproject():
-    pins = [dep for dep in _pyproject_deps() if _requirement_name(dep) == CLOUD_TASKS_NAME]
+    pins = [
+        dep for dep in _pyproject_deps() if _requirement_name(dep) == CLOUD_TASKS_NAME
+    ]
     assert pins == [EXPECTED_CLOUD_TASKS_PIN]
 
     matching = [
-        line for line in _requirements_lines() if _requirement_name(line) == CLOUD_TASKS_NAME
+        line
+        for line in _requirements_lines()
+        if _requirement_name(line) == CLOUD_TASKS_NAME
     ]
     assert matching == pins, (
         "frontend/requirements.txt must include the same google-cloud-tasks pin as "
