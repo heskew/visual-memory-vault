@@ -4,6 +4,7 @@ a2a-sdk>=1.1.0
 httpx
 google-auth
 google-cloud-storage
+google-cloud-tasks>=2.16.0,<3.0.0
 python-multipart
 Pillow>=10.0.0
 pillow-heif>=0.18.0
