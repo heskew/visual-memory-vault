@@ -73,7 +73,10 @@ CLOUD_TASKS_PROJECT = os.environ.get("CLOUD_TASKS_PROJECT") or os.environ.get(
 # Operator-provided Cloud Run / proxy base. Never invent a hosted URL.
 INGEST_HANDLER_URL = os.environ.get("INGEST_HANDLER_URL")
 INGEST_TASKS_OIDC_SA = os.environ.get("INGEST_TASKS_OIDC_SA")
-INGEST_LEASE_SEC = float(os.environ.get("INGEST_LEASE_SEC", "120"))
+# Lease must outlive the longest possible ingest, i.e. the 120s A2A client
+# timeout in ingest_uploaded_image, so a still-running job is not reclaimed by
+# a second worker and processed (and stored) twice. Keep comfortably above 120.
+INGEST_LEASE_SEC = float(os.environ.get("INGEST_LEASE_SEC", "300"))
 
 if "A2A_BASE_URL" in os.environ:
     A2A_BASE = os.environ["A2A_BASE_URL"]
@@ -1183,6 +1186,10 @@ async def get_media(
 ):
     """Authenticated image retrieval endpoint requiring API Key verification."""
     verify_api_key(req, x_api_key)
+
+    # Reject any name that is not a bare filename (path traversal defense).
+    if os.path.basename(image_name) != image_name or image_name in ("", ".", ".."):
+        raise HTTPException(status_code=404, detail="Image not found")
 
     # 1. Check local media directory first
     local_path = os.path.join(MEDIA_DIR, image_name)
