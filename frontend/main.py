@@ -94,6 +94,14 @@ A2A_CARD_URL = f"{A2A_BASE}/.well-known/agent-card.json"
 
 _A2UI_MIME = "application/json+a2ui"
 API_KEY = os.environ.get("PROXY_API_KEY", "")
+# When no PROXY_API_KEY is set the proxy fails closed by default so a
+# misconfigured deploy is never silently public. Opt into open access
+# explicitly for local development with ALLOW_UNAUTHENTICATED=1.
+ALLOW_UNAUTHENTICATED = os.environ.get("ALLOW_UNAUTHENTICATED", "").lower() in (
+    "1",
+    "true",
+    "yes",
+)
 _RECEIPT_LINE_RE = re.compile(
     r"RECEIPT:\s*(\{.*?\})\s*[^\n]*$", re.MULTILINE | re.DOTALL
 )
@@ -194,7 +202,17 @@ app = FastAPI(title="Visual Memory Vault Proxy", lifespan=_lifespan)
 
 def verify_api_key(req: Request, x_api_key: str | None = None):
     key = x_api_key or req.headers.get("X-Api-Key") or req.query_params.get("key")
-    if not API_KEY or key == API_KEY:
+    if not API_KEY:
+        if ALLOW_UNAUTHENTICATED:
+            return True
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Proxy auth is not configured. Set PROXY_API_KEY, or "
+                "ALLOW_UNAUTHENTICATED=1 for local development."
+            ),
+        )
+    if key == API_KEY:
         return True
     raise HTTPException(status_code=401, detail="Unauthorized: Invalid API Key")
 

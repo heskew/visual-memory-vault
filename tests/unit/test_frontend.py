@@ -41,10 +41,25 @@ def _jpeg_bytes() -> bytes:
     return buf.getvalue()
 
 
-def test_verify_api_key_when_no_key_configured(monkeypatch):
+@pytest.fixture(autouse=True)
+def _open_proxy_for_functional_tests(monkeypatch):
+    # Most tests exercise proxy endpoints without a configured PROXY_API_KEY.
+    # Default them into the explicit local-dev open mode so auth does not block
+    # them; the auth-specific tests override this.
+    monkeypatch.setattr("frontend.main.ALLOW_UNAUTHENTICATED", True)
+
+
+def test_verify_api_key_fails_closed_when_unconfigured(monkeypatch):
     monkeypatch.setattr("frontend.main.API_KEY", "")
+    monkeypatch.setattr("frontend.main.ALLOW_UNAUTHENTICATED", False)
     scope = {"type": "http", "headers": [], "query_string": b""}
     req = Request(scope)
+    with pytest.raises(HTTPException) as exc:
+        verify_api_key(req)
+    assert exc.value.status_code == 503
+
+    # Explicit local-dev opt-in re-opens the proxy.
+    monkeypatch.setattr("frontend.main.ALLOW_UNAUTHENTICATED", True)
     assert verify_api_key(req) is True
 
 
