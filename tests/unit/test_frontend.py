@@ -48,6 +48,18 @@ def test_verify_api_key_when_no_key_configured(monkeypatch):
     assert verify_api_key(req) is True
 
 
+@pytest.mark.asyncio
+async def test_get_media_rejects_path_traversal_names():
+    from frontend.main import get_media
+
+    scope = {"type": "http", "headers": [], "query_string": b""}
+    req = Request(scope)
+    for bad in ("..", ".", "../../etc/passwd", "sub/evil.jpg"):
+        with pytest.raises(HTTPException) as exc:
+            await get_media(bad, req)
+        assert exc.value.status_code == 404
+
+
 def test_verify_api_key_when_configured(monkeypatch):
     monkeypatch.setattr("frontend.main.API_KEY", "secret-key")
     scope = {
