@@ -19,7 +19,7 @@ Google ADK provides the modular, production-ready runtime for agentic workflows:
 ### 2. Harper: The High-Performance Distributed Data Fabric
 Harper provides the underlying enterprise data fabric powering low-latency distributed agent storage:
 - **Extreme Speed & Simplicity**: Combines structured database, document store, and real-time streaming in a single ultra-fast engine.
-- **Edge to Cloud Fabric**: Run locally during development or deploy across global edge clusters via [Harper Fabric](https://harperdb.io) with automatic synchronization.
+- **Edge to Cloud Fabric**: Run locally during development or deploy across global edge clusters via [Harper Fabric](https://harper.fast) with automatic synchronization.
 - **Zero Database Sprawl**: Eliminates the need for separate caching layers, message buses, and vector databases.
 
 ### 3. Flair: The Open Agent Memory Standard
@@ -161,23 +161,24 @@ The in-app web UI uses the same `POST /upload`, then polls `GET /jobs/{job_id}` 
 
 ## 🧪 Test Suite
 
-Run the full automated test suite (Unit tests + live Flair Integration tests):
+Unit tests run fully offline with mocked services and cover the agent's real
+tool path (`store_memory`, `search_memory`, `list_memories` as wired in
+`app/agent.py`):
 
 ```bash
-uv run pytest tests/unit tests/integration/test_flair_vault.py -v
+uv run pytest tests/unit -v
 ```
 
+The integration tests exercise a live Flair daemon and the running proxy, so
+point `FLAIR_URL` and the agent identity (see Quickstart) at a reachable
+instance first:
+
+```bash
+uv run pytest tests/integration -v
 ```
-tests/unit/test_agent.py::test_agent_configuration PASSED
-tests/unit/test_agent.py::test_agent_instruction_requires_receipt_custom_metadata PASSED
-tests/unit/test_agent.py::test_app_structure PASSED
-tests/unit/test_tools.py::test_store_memory_passes_receipt_custom_metadata PASSED
-tests/unit/test_tools.py::test_search_memory_returns_live_shape PASSED
-tests/unit/test_tools.py::test_list_memories_returns_live_shape PASSED
-tests/unit/test_services.py::test_memory_service PASSED
-tests/integration/test_flair_vault.py::test_flair_vault_end_to_end PASSED
-======================== 24 passed in 0.85s =========================
-```
+
+CI runs the unit suite and lint on every push and pull request
+(`.github/workflows/ci.yml`).
 
 ---
 
