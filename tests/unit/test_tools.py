@@ -1,3 +1,4 @@
+import hashlib
 from unittest.mock import AsyncMock, patch
 
 from adk_flair import FlairMemoryService
@@ -87,3 +88,35 @@ def test_list_memories_returns_live_shape():
     assert res["count"] == 1
     assert res["memories"][0]["id"] == "mem-1"
     assert res["memories"][0]["subject"] == "Test"
+
+
+def _stored_entry(fake):
+    return fake.add_memory.await_args.kwargs["memories"][0]
+
+
+def test_store_memory_uses_stable_id_from_image_url():
+    fake = FakeFlair()
+    meta = {"image_url": "/media/receipt.jpg"}
+    expected = hashlib.sha256(b"vault:/media/receipt.jpg").hexdigest()[:32]
+
+    with patch.object(services, "get_memory_service", return_value=fake):
+        store_memory(
+            "Receipt", "Total $58.40 at Joe's Grill.", custom_metadata=dict(meta)
+        )
+        first_id = _stored_entry(fake).id
+        # A retry whose description drifts must still hit the same record id.
+        store_memory(
+            "Receipt", "Dinner totalling 58.40 dollars.", custom_metadata=dict(meta)
+        )
+        second_id = _stored_entry(fake).id
+
+    assert first_id == expected
+    assert second_id == expected
+
+
+def test_store_memory_without_key_falls_back_to_content_hash():
+    fake = FakeFlair()
+    with patch.object(services, "get_memory_service", return_value=fake):
+        store_memory("Note", "A chat-originated memory with no image.")
+    # id None -> adk-flair hashes the content itself (no regression).
+    assert _stored_entry(fake).id is None
