@@ -65,6 +65,12 @@ def test_euro_symbol_maps_to_eur():
     assert res["score"] == 1.0
 
 
+def test_norm_merchant_folds_accents_before_alnum_strip():
+    """Accented Café must match unaccented Cafe after NFKD fold."""
+    assert metric._norm_merchant("Café") == metric._norm_merchant("Cafe")
+    assert metric._norm_merchant("Café") == "cafe"
+
+
 def test_plain_string_shapes_are_accepted():
     import json
 

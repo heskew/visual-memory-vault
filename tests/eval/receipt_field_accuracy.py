@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import re
+import unicodedata
 from datetime import datetime
 
 _FIELDS = ("merchant", "amount", "currency", "date")
@@ -76,7 +77,12 @@ def parse_receipt(text: str) -> dict:
 def _norm_merchant(v: str | None) -> str:
     if not v:
         return ""
-    return re.sub(r"[^a-z0-9]", "", v.lower())
+    folded = "".join(
+        ch
+        for ch in unicodedata.normalize("NFKD", v)
+        if unicodedata.category(ch) != "Mn"
+    )
+    return re.sub(r"[^a-z0-9]", "", folded.lower())
 
 
 def _norm_currency(v: str | None) -> str:
