@@ -1,11 +1,13 @@
 import asyncio
 import functools
+import hashlib
 from typing import Any
 
 from adk_flair import FlairMemoryService
 from adk_flair.tools import create_flair_tools
 from google.adk.agents import Agent
 from google.adk.apps import App
+from google.adk.memory.memory_entry import MemoryEntry
 from google.adk.models import Gemini
 from google.genai import types
 
@@ -55,10 +57,78 @@ def _get_runtime_tools():
     return create_flair_tools(svc, app_name="visual-memory-vault", user_id="user")
 
 
-@functools.wraps(_async_store)
-def store_memory(*args: Any, **kwargs: Any) -> dict:
-    tools = _get_runtime_tools()
-    return _run_sync(tools[0](*args, **kwargs))
+def _stable_memory_id(custom_metadata: dict | None) -> str | None:
+    """Deterministic Flair record id from a stable per-image key.
+
+    adk-flair upserts by record id and otherwise hashes the content, so two
+    ingest runs of the same image (e.g. a Cloud Tasks retry after the
+    store-commit marker write failed) would create two records whenever the
+    model's description drifts between runs. Keying the id on the stable
+    ``image_url`` the proxy passes makes re-ingestion idempotent. Returns None
+    when no stable key is present, preserving adk-flair's content-hash behavior
+    (e.g. chat-originated stores with no image).
+    """
+    if not custom_metadata:
+        return None
+    key = custom_metadata.get("idempotency_key") or custom_metadata.get("image_url")
+    if not key:
+        return None
+    return hashlib.sha256(f"vault:{key}".encode()).hexdigest()[:32]
+
+
+async def _store_memory_impl(
+    subject: str,
+    description: str,
+    tags: list[str] | None = None,
+    custom_metadata: dict | None = None,
+) -> dict:
+    if not description or not description.strip():
+        return {"error": "description must be non-empty - provide the memory text"}
+    metadata = dict(custom_metadata) if custom_metadata is not None else None
+    if tags is not None:
+        if metadata is None:
+            metadata = {}
+        metadata["tags"] = list(tags)
+    entry = MemoryEntry(
+        id=_stable_memory_id(metadata),
+        content=types.Content(role="user", parts=[types.Part(text=description)]),
+    )
+    try:
+        await services.get_memory_service().add_memory(
+            app_name="visual-memory-vault",
+            user_id="user",
+            memories=[entry],
+            custom_metadata=metadata,
+            subject=subject,
+        )
+    except ValueError as exc:
+        return {"error": str(exc)}
+    return {"status": "stored", "subject": subject}
+
+
+def store_memory(
+    subject: str,
+    description: str,
+    tags: list[str] | None = None,
+    custom_metadata: dict | None = None,
+) -> dict:
+    """Save a memory to the user's long-term Flair memory.
+
+    Storing the same image again (same image_url in custom_metadata) updates the
+    one record rather than creating a duplicate.
+
+    Args:
+        subject: Short human-readable title for the memory.
+        description: The full text of the memory, understandable on its own.
+        tags: Optional short category labels, e.g. ["receipt", "travel"].
+        custom_metadata: Optional structured attributes stored verbatim, e.g.
+            {"merchant": "...", "amount": "...", "image_url": "/media/x.jpg"}.
+
+    Returns:
+        {"status": "stored", "subject": <subject>} on success, or
+        {"error": <message>} on failure.
+    """
+    return _run_sync(_store_memory_impl(subject, description, tags, custom_metadata))
 
 
 @functools.wraps(_async_search)
