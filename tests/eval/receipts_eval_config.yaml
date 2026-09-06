@@ -1,0 +1,28 @@
+# Eval config for the multimodal receipt dataset (tests/eval/datasets/receipts-dataset.json).
+# Run:
+#   agents-cli eval run --dataset tests/eval/datasets/receipts-dataset.json \
+#     --config tests/eval/receipts_eval_config.yaml
+#
+# receipt_field_accuracy is deterministic and local (no judge model): the fields
+# have exact answers, so it scores the fraction of merchant/amount/currency/date
+# the agent extracted correctly. multimodal_response_quality is an optional
+# vision LLM-judge for holistic quality; add it to metrics_to_run to enable it
+# (needs a vision-capable judge model and API access).
+metrics_to_run:
+  - receipt_field_accuracy
+
+custom_metrics:
+  - name: receipt_field_accuracy
+    custom_function_file: receipt_field_accuracy.py
+
+  - name: multimodal_response_quality
+    prompt_template: |
+      You are evaluating whether the agent's text response accurately reflects
+      the receipt image in the user's input. Inspect the user input parts (which
+      include the receipt image) and the agent response, then return JSON:
+      {"score": <0.0-1.0>, "explanation": "<reason>"}.
+
+      User input: {prompt}
+      Agent response: {response}
+    judge_model: gemini-3.6-flash
+    judge_model_sampling_count: 3
