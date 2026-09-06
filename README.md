@@ -182,6 +182,25 @@ CI runs the unit suite and lint on every push and pull request
 
 ---
 
+## 📈 Evaluation
+
+The agent is evaluated with the ADK eval flywheel (`agents-cli eval`). Beyond the
+text cases in `tests/eval/datasets/basic-dataset.json`, a **multimodal receipt
+dataset** feeds real receipt images through the agent and grades the extracted
+`merchant` / `amount` / `currency` / `date` with a deterministic metric:
+
+```bash
+agents-cli eval run \
+  --dataset tests/eval/datasets/receipts-dataset.json \
+  --config tests/eval/receipts_eval_config.yaml
+```
+
+The dataset is generated from `tests/eval/fixtures/generate_receipt_dataset.py`,
+and both its shape and the scoring metric are covered by offline unit tests. See
+`tests/eval/datasets/README.md` for details.
+
+---
+
 ## 📦 Tech Stack
 
 | Component | Technology | Purpose |

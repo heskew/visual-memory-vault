@@ -108,3 +108,34 @@ Once you have a baseline, the eval surface has a few more commands worth knowing
 - `agents-cli eval optimize` — auto-tune your agent's prompts using eval data.
 
 See the [Evaluation Guide](https://google.github.io/agents-cli/guide/evaluation/) for the full surface and metric reference.
+
+
+## Multimodal Receipt Dataset
+
+`receipts-dataset.json` verifies the agent's headline capability: reading a
+receipt image and extracting structured fields. Each case carries a receipt
+image inline (`inline_data`, base64 JPEG) plus a text instruction, and its
+`reference` holds the ground-truth `merchant` / `amount` / `currency` / `date`.
+
+It is generated deterministically from `../fixtures/generate_receipt_dataset.py`
+(synthetic receipts with known fields), so it is self-contained and needs no
+external image files. Regenerate after editing the specs:
+
+```bash
+uv run python tests/eval/fixtures/generate_receipt_dataset.py
+```
+
+Grade it with the dedicated config, which selects the deterministic
+`receipt_field_accuracy` metric (fraction of the four fields extracted
+correctly — no judge model needed):
+
+```bash
+agents-cli eval run \
+  --dataset tests/eval/datasets/receipts-dataset.json \
+  --config tests/eval/receipts_eval_config.yaml
+```
+
+A full local run invokes the agent, so it needs `GOOGLE_API_KEY` (or Vertex
+ADC) and, for the store step, a reachable Flair instance (see the Quickstart).
+The dataset shape and the metric are covered by offline unit tests
+(`tests/unit/test_receipts_dataset.py`, `tests/unit/test_receipt_metric.py`).
