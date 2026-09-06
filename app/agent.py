@@ -1,6 +1,5 @@
 import asyncio
 import functools
-import hashlib
 from typing import Any
 
 from adk_flair import FlairMemoryService
@@ -12,6 +11,7 @@ from google.adk.models import Gemini
 from google.genai import types
 
 from app.app_utils import services
+from app.app_utils.memory_ids import stable_memory_id
 
 MODEL = "gemini-3.7-flash"
 
@@ -57,25 +57,6 @@ def _get_runtime_tools():
     return create_flair_tools(svc, app_name="visual-memory-vault", user_id="user")
 
 
-def _stable_memory_id(custom_metadata: dict | None) -> str | None:
-    """Deterministic Flair record id from a stable per-image key.
-
-    adk-flair upserts by record id and otherwise hashes the content, so two
-    ingest runs of the same image (e.g. a Cloud Tasks retry after the
-    store-commit marker write failed) would create two records whenever the
-    model's description drifts between runs. Keying the id on the stable
-    ``image_url`` the proxy passes makes re-ingestion idempotent. Returns None
-    when no stable key is present, preserving adk-flair's content-hash behavior
-    (e.g. chat-originated stores with no image).
-    """
-    if not custom_metadata:
-        return None
-    key = custom_metadata.get("idempotency_key") or custom_metadata.get("image_url")
-    if not key:
-        return None
-    return hashlib.sha256(f"vault:{key}".encode()).hexdigest()[:32]
-
-
 async def _store_memory_impl(
     subject: str,
     description: str,
@@ -90,7 +71,7 @@ async def _store_memory_impl(
             metadata = {}
         metadata["tags"] = list(tags)
     entry = MemoryEntry(
-        id=_stable_memory_id(metadata),
+        id=stable_memory_id(metadata),
         content=types.Content(role="user", parts=[types.Part(text=description)]),
     )
     try:
