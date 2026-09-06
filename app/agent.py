@@ -65,11 +65,15 @@ async def _store_memory_impl(
 ) -> dict:
     if not description or not description.strip():
         return {"error": "description must be non-empty - provide the memory text"}
-    metadata = dict(custom_metadata) if custom_metadata is not None else None
+    metadata = dict(custom_metadata) if custom_metadata is not None else {}
     if tags is not None:
-        if metadata is None:
-            metadata = {}
         metadata["tags"] = list(tags)
+    # Flair's first-class subject column is the write channel; also copy into
+    # the blob so readers that only see custom_metadata still get the title.
+    if subject:
+        metadata["subject"] = subject
+    if not metadata:
+        metadata = None
     entry = MemoryEntry(
         id=stable_memory_id(metadata),
         content=types.Content(role="user", parts=[types.Part(text=description)]),

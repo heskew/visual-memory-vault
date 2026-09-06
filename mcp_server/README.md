@@ -20,8 +20,10 @@ the vault's memories:
 
 - `FLAIR_URL`, `FLAIR_AGENT_ID=visual-memory-vault`, and `FLAIR_KEYFILE` (or
   `FLAIR_PRIVATE_KEY_B64` in containers).
-- `GCS_BUCKET_NAME` to mint signed image URLs; or `VAULT_PROXY_URL` to return
-  proxy `/media` links; otherwise the stored reference is returned as-is.
+- `GCS_BUCKET_NAME` to mint signed image URLs (IAM `signBlob` on Cloud Run);
+  `VAULT_PROXY_URL` for proxy `/media` links if signing is unavailable.
+  Signing failure without a proxy returns no image URL (not a dead `/media`
+  path). Without a bucket, the stored reference is returned as-is.
 - `VAULT_SIGNED_URL_TTL_MIN` (default 60).
 
 ## Use it from Claude Code (local, stdio — works today)

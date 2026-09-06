@@ -57,6 +57,8 @@ def test_store_memory_passes_receipt_custom_metadata():
     assert stored["date"] == "2026-08-20"
     assert stored["image_url"] == "/media/receipt.jpg"
     assert stored["tags"] == ["receipt"]
+    assert stored["subject"] == "Joe's Grill Receipt - $58.40"
+    assert kwargs["subject"] == "Joe's Grill Receipt - $58.40"
 
 
 def test_search_memory_returns_live_shape():

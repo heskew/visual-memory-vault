@@ -39,6 +39,18 @@ def _requirements_lines() -> list[str]:
     ]
 
 
+def test_uv_lock_includes_mcp_extra():
+    """CI and the MCP image run `uv sync --extra mcp`; the lock must pin it."""
+    lock = (REPO_ROOT / "uv.lock").read_text()
+    assert '\nname = "mcp"\n' in lock
+    assert "extra == 'mcp'" in lock
+    vault = lock.split('name = "visual-memory-vault"', 1)[1]
+    extras_line = next(
+        line for line in vault.splitlines() if line.startswith("provides-extras")
+    )
+    assert "mcp" in extras_line
+
+
 def test_frontend_requirements_pins_google_cloud_tasks_like_pyproject():
     pins = [
         dep for dep in _pyproject_deps() if _requirement_name(dep) == CLOUD_TASKS_NAME
