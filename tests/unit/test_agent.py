@@ -1,4 +1,4 @@
-from app.agent import app, root_agent
+from app.agent import app, root_agent, store_memory
 
 
 def test_agent_configuration():
@@ -18,6 +18,15 @@ def test_agent_instruction_requires_receipt_custom_metadata():
     assert "amount" in instruction
     assert "date" in instruction
     assert "custom_metadata" in instruction
+
+
+def test_agent_instruction_copies_url_capture_metadata():
+    instruction = root_agent.instruction
+    assert "capture_kind" in instruction
+    assert "source_url" in instruction
+    assert "captured_at" in instruction
+    assert "source_url" in (store_memory.__doc__ or "")
+    assert 'capture_kind="url"' in (store_memory.__doc__ or "")
 
 
 def test_app_structure():

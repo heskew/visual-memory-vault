@@ -104,6 +104,8 @@ agents-cli deploy \
    ```
    Cloud Run is HTTP edge only and may scale to zero after `202`. The upload request does not run Gemini/Flair and does not rely on `create_task`. Persist the image, write a durable job (`vault-jobs/` when `GCS_BUCKET_NAME` is set), and enqueue Cloud Tasks to `POST /ingest` on the proxy you already deployed (`INGEST_HANDLER_URL`). That new request talks to Agent Engine. Poll `GET /jobs/{job_id}` for `pending` / `succeeded` / `failed`. Shortcut clients must not call `/ingest`. Local uvicorn may set `INGEST_DRAIN_INTERVAL_SEC` for a dev-only loop.
 
+   To capture a public web page instead of a photo, `POST /capture/url` on that same proxy with JSON `{"url":"https://example.com","subject":"Example"}`. The response is the same `202` (`status`, `job_id`, `image_path`). The URL, subject, and `capture_kind=url` are stored on the durable job; the worker screenshots the page before extract and `store_memory`. The memory metadata includes `source_url`, `captured_at`, and `capture_kind=url`. Poll `GET /jobs/{job_id}` the same way. A bad URL, an unsupported scheme, a blocked address, or a render timeout finishes as `failed`.
+
    2. Verify the memory appears in your `casa.heskew` Flair instance:
    ```bash
    flair memory list --target https://casa.heskew.harperfabric.com
