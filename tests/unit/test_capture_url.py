@@ -15,10 +15,14 @@ from PIL import Image
 
 from frontend import capture as capture_mod
 from frontend.capture import (
+    CHROMIUM_LAUNCH_ARGS,
     CaptureRejected,
     CaptureTransient,
     capture_store_metadata,
     ensure_request_allowed,
+    fetch_pinned_response,
+    handle_capture_route,
+    pin_public_address,
     validate_capture_url,
 )
 from frontend.main import (
@@ -520,3 +524,200 @@ async def test_existing_screenshot_is_not_rendered_again(_capture_env, monkeypat
         )
         assert consumer.status_code == 200
     assert load_job(accepted.json()["job_id"])["capture_rendered"] is True
+
+
+class _Frame:
+    def __init__(self, parent: _Frame | None) -> None:
+        self.parent_frame = parent
+
+
+class _Request:
+    def __init__(
+        self,
+        url: str,
+        *,
+        resource_type: str = "document",
+        frame: _Frame | None = None,
+        navigation: bool = True,
+    ) -> None:
+        self.url = url
+        self.resource_type = resource_type
+        self.frame = frame
+        self.method = "GET"
+        self.headers: dict[str, str] = {}
+        self.post_data_buffer = None
+        self._navigation = navigation
+
+    def is_navigation_request(self) -> bool:
+        return self._navigation
+
+
+class _Route:
+    def __init__(self, request: _Request) -> None:
+        self.request = request
+        self.action = None
+        self.fulfilled = None
+
+    def abort(self, *_args, **_kwargs) -> None:
+        self.action = "abort"
+
+    def continue_(self, **_kwargs) -> None:
+        self.action = "continue"
+
+    def fulfill(self, **kwargs) -> None:
+        self.action = "fulfill"
+        self.fulfilled = kwargs
+
+
+def _must_not_fetch(*_args, **_kwargs):
+    raise AssertionError("this request must not be fetched")
+
+
+def test_blocked_iframe_does_not_fail_capture():
+    """A bad iframe is aborted. The top-level page is still fetched."""
+    blocked = {"document": False}
+    main = _Frame(None)
+    iframe = _Frame(main)
+
+    def resolver(host: str) -> list[str]:
+        if host == "missing.example":
+            raise CaptureRejected("bad_url")
+        return ["93.184.216.34"]
+
+    for url in (
+        "http://10.1.2.3/frame",
+        "http://169.254.169.254/computeMetadata/v1/",
+        "file:///etc/passwd",
+        "https://missing.example/embed",
+    ):
+        route = _Route(
+            _Request(url, resource_type="document", frame=iframe, navigation=True)
+        )
+        handle_capture_route(route, blocked, resolver=resolver, fetch=_must_not_fetch)
+        assert route.action == "abort", url
+        assert blocked["document"] is False, url
+
+    image = _Route(
+        _Request(
+            "http://192.168.0.9/pixel.gif",
+            resource_type="image",
+            frame=main,
+            navigation=False,
+        )
+    )
+    handle_capture_route(image, blocked, resolver=resolver, fetch=_must_not_fetch)
+    assert image.action == "abort"
+    assert blocked["document"] is False
+
+    def fetch(*_args, **_kwargs):
+        return 200, {"Content-Type": "text/html"}, b"<html>ok</html>"
+
+    page = _Route(
+        _Request(
+            "https://example.com/docs",
+            resource_type="document",
+            frame=main,
+            navigation=True,
+        )
+    )
+    handle_capture_route(page, blocked, resolver=resolver, fetch=fetch)
+    assert page.action == "fulfill"
+    assert page.fulfilled["body"] == b"<html>ok</html>"
+    assert blocked["document"] is False
+
+
+def test_blocked_main_frame_still_fails_capture():
+    blocked = {"document": False}
+    route = _Route(
+        _Request(
+            "http://169.254.169.254/",
+            resource_type="document",
+            frame=_Frame(None),
+            navigation=True,
+        )
+    )
+    handle_capture_route(route, blocked, resolver=_public, fetch=_must_not_fetch)
+    assert route.action == "abort"
+    assert blocked["document"] is True
+
+
+def test_pin_does_not_reuse_an_earlier_public_answer():
+    answers = [["8.8.8.8"], ["1.1.1.1"], ["169.254.169.254"]]
+
+    def resolver(_host: str) -> list[str]:
+        return answers.pop(0)
+
+    assert pin_public_address("example.com", resolver=resolver) == "8.8.8.8"
+    assert pin_public_address("example.com", resolver=resolver) == "1.1.1.1"
+    with pytest.raises(CaptureRejected) as exc:
+        pin_public_address("example.com", resolver=resolver)
+    assert exc.value.reason == "blocked_url"
+    assert answers == []
+
+
+def test_pin_rejects_a_mixed_public_and_private_answer():
+    def resolver(_host: str) -> list[str]:
+        return ["93.184.216.34", "10.0.0.1"]
+
+    with pytest.raises(CaptureRejected) as exc:
+        pin_public_address("example.com", resolver=resolver)
+    assert exc.value.reason == "blocked_url"
+
+
+def test_pinned_fetch_dials_the_validated_ip_not_the_hostname(monkeypatch):
+    seen = {}
+
+    def connect(address, timeout=None, source_address=None):
+        seen["address"] = address
+        raise TimeoutError("stop before tls")
+
+    monkeypatch.setattr("frontend.capture.socket.create_connection", connect)
+    with pytest.raises(CaptureTransient):
+        fetch_pinned_response(
+            "GET",
+            "https://example.com/docs",
+            {},
+            None,
+            resolver=lambda _host: ["93.184.216.34"],
+        )
+    assert seen["address"] == ("93.184.216.34", 443)
+
+
+def test_connect_time_rebinding_does_not_open_a_socket(monkeypatch):
+    calls = {"n": 0}
+    connected = {"yes": False}
+
+    def resolver(_host: str) -> list[str]:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return ["93.184.216.34"]
+        return ["169.254.169.254"]
+
+    def connect(*_args, **_kwargs):
+        connected["yes"] = True
+        raise AssertionError("rebinding must not open a socket")
+
+    monkeypatch.setattr("frontend.capture.socket.create_connection", connect)
+    blocked = {"document": False}
+    route = _Route(
+        _Request(
+            "https://rebind.example/secret",
+            resource_type="document",
+            frame=_Frame(None),
+            navigation=True,
+        )
+    )
+    handle_capture_route(route, blocked, resolver=resolver)
+    assert route.action == "abort"
+    assert blocked["document"] is True
+    assert connected["yes"] is False
+    assert calls["n"] >= 2
+
+
+def test_chromium_cannot_resolve_on_its_own():
+    assert "--disable-quic" in CHROMIUM_LAUNCH_ARGS
+    assert "--dns-prefetch-disable" in CHROMIUM_LAUNCH_ARGS
+    assert any(
+        arg.startswith("--disable-features=") and "WebRTC" in arg
+        for arg in CHROMIUM_LAUNCH_ARGS
+    )

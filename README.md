@@ -181,7 +181,7 @@ Response (`202 Accepted`):
 
 The stored memory's `custom_metadata` includes `source_url`, `captured_at`, and `capture_kind` `url`, and the description mentions the page so recall can find it.
 
-Only public HTTP(S) URLs are captured. Other schemes, unresolvable hosts, and addresses that are loopback, private, link-local, or cloud metadata finish as `failed` with `unsupported_scheme`, `bad_url`, or `blocked_url`. A render that exceeds `CAPTURE_RENDER_TIMEOUT_SEC` (default 20s) finishes as `failed` with `render_timeout`. A transient render or DNS blip stays `pending` and is retried like any other ingest. The proxy image installs headless Chromium; give that Cloud Run service at least 1GiB of memory. Gated pages that need a signed-in browser are out of scope.
+Only public HTTP(S) URLs are captured. Other schemes, unresolvable hosts, and addresses that are loopback, private, link-local, or cloud metadata finish as `failed` with `unsupported_scheme`, `bad_url`, or `blocked_url` when that target is the top-level page. A blocked iframe or other subresource is dropped and the screenshot of the page still completes. Each request is connected only to an address checked at connect time, so a hostname that later points at a private or link-local address is not fetched. A render that exceeds `CAPTURE_RENDER_TIMEOUT_SEC` (default 20s) finishes as `failed` with `render_timeout`. A transient render or DNS blip stays `pending` and is retried like any other ingest. The proxy image installs headless Chromium; give that Cloud Run service at least 1GiB of memory. Gated pages that need a signed-in browser are out of scope.
 
 ---
 

@@ -2,12 +2,16 @@
 
 The proxy accepts the URL immediately. This module runs inside the ingest
 worker: reject schemes and addresses that must never be fetched, then render
-a viewport JPEG with headless Chromium. Callers persist that JPEG on the
-existing upload path.
+a viewport JPEG with headless Chromium. HTTP(S) responses are fetched on a
+socket pinned to an address checked at connect time. Chromium does not
+resolve those names itself. A blocked iframe is dropped; only a blocked
+top-level page fails the capture. Callers persist the JPEG on the existing
+upload path.
 """
 
 from __future__ import annotations
 
+import http.client
 import ipaddress
 import os
 import re
@@ -22,6 +26,32 @@ CAPTURE_MAX_IMAGE_BYTES = 8 * 1024 * 1024
 CAPTURE_VIEWPORT_WIDTH = 1280
 CAPTURE_VIEWPORT_HEIGHT = 720
 CAPTURE_JPEG_QUALITY = 80
+CAPTURE_MAX_SUBRESOURCE_BYTES = 8 * 1024 * 1024
+# Chromium must not open its own sockets. QUIC and WebRTC bypass an HTTP
+# route handler; DNS prefetch would resolve names the worker never checked.
+CHROMIUM_LAUNCH_ARGS = (
+    "--no-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-gpu",
+    "--disable-quic",
+    "--dns-prefetch-disable",
+    "--disable-features=WebRTC",
+)
+_HOP_BY_HOP = frozenset(
+    {
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailers",
+        "transfer-encoding",
+        "upgrade",
+        "proxy-connection",
+        "host",
+        "content-length",
+    }
+)
 
 _ALLOWED_SCHEMES = frozenset({"http", "https"})
 _NON_NETWORK_SCHEMES = frozenset({"data", "blob", "about"})
@@ -227,6 +257,176 @@ def ensure_request_allowed(url: str, *, resolver=None) -> None:
     validate_capture_url(url, resolver=resolver, limit_length=False)
 
 
+def pin_public_address(host: str, *, resolver=None) -> str:
+    """Fresh public IP for ``host``. Never reuse an earlier lookup.
+
+    A name that resolves to any non-global address is rejected, even when
+    another answer is public. The returned address is the only one a later
+    connect may use.
+    """
+    normalized = (host or "").lower().rstrip(".")
+    if not normalized:
+        raise CaptureRejected("bad_url")
+    if _host_is_blocked_name(normalized):
+        raise CaptureRejected("blocked_url")
+    literal = _ip_from_host(normalized)
+    if literal is not None:
+        if _ip_is_blocked(literal):
+            raise CaptureRejected("blocked_url")
+        return str(literal)
+    lookup = resolver or resolve_host
+    chosen: str | None = None
+    for address in lookup(normalized):
+        try:
+            parsed = ipaddress.ip_address(str(address).split("%", 1)[0])
+        except ValueError as exc:
+            raise CaptureRejected("bad_url") from exc
+        if _ip_is_blocked(parsed):
+            raise CaptureRejected("blocked_url")
+        if chosen is None:
+            chosen = str(parsed)
+    if chosen is None:
+        raise CaptureRejected("bad_url")
+    return chosen
+
+
+def _is_top_level_document(request) -> bool:
+    """True only for the main-frame document navigation.
+
+    Iframe and other subframe document requests are not fatal: they are
+    aborted and the screenshot of the top page continues. A missing frame
+    fails closed so an unclassified navigation cannot skip the block.
+    """
+    resource_type = getattr(request, "resource_type", "") or ""
+    is_navigation = False
+    checker = getattr(request, "is_navigation_request", None)
+    if callable(checker):
+        try:
+            is_navigation = bool(checker())
+        except Exception:
+            is_navigation = True
+    if resource_type != "document" and not is_navigation:
+        return False
+    frame = getattr(request, "frame", None)
+    if frame is None:
+        return True
+    return getattr(frame, "parent_frame", None) is None
+
+
+def fetch_pinned_response(
+    method: str,
+    url: str,
+    headers: dict | None,
+    body: bytes | None,
+    *,
+    resolver=None,
+) -> tuple[int, dict[str, str], bytes]:
+    """HTTP(S) GET/POST connected only to ``pin_public_address``.
+
+    The TCP peer is that IP. TLS still uses the original hostname for SNI
+    and certificate checks. Chromium never resolves this URL itself.
+    """
+    parsed = urlparse(url)
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in _ALLOWED_SCHEMES:
+        raise CaptureRejected("unsupported_scheme")
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if not host:
+        raise CaptureRejected("bad_url")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise CaptureRejected("bad_url") from exc
+    if port is None:
+        port = 443 if scheme == "https" else 80
+    ip = pin_public_address(host, resolver=resolver)
+    ascii_host = host.encode("idna").decode("ascii")
+    if scheme == "https":
+        conn: http.client.HTTPConnection = http.client.HTTPSConnection(
+            ascii_host, port, timeout=10
+        )
+    else:
+        conn = http.client.HTTPConnection(ascii_host, port, timeout=10)
+
+    def connect_to_pin(address, timeout=None, source_address=None):
+        conn_port = address[1]
+        return socket.create_connection((ip, conn_port), timeout, source_address)
+
+    conn._create_connection = connect_to_pin
+    path = parsed.path or "/"
+    if parsed.query:
+        path = f"{path}?{parsed.query}"
+    outbound: dict[str, str] = {}
+    for key, value in (headers or {}).items():
+        lowered = key.lower()
+        if lowered in _HOP_BY_HOP or lowered.startswith(":"):
+            continue
+        outbound[key] = value
+    try:
+        conn.request(method or "GET", path, body=body, headers=outbound)
+        response = conn.getresponse()
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = response.read(65536)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > CAPTURE_MAX_SUBRESOURCE_BYTES:
+                raise CaptureTransient("render_failed")
+            chunks.append(chunk)
+        header_map: dict[str, str] = {}
+        for key, value in response.getheaders():
+            if key.lower() in _HOP_BY_HOP:
+                continue
+            header_map[key] = value
+        return response.status, header_map, b"".join(chunks)
+    except (CaptureRejected, CaptureTransient):
+        raise
+    except (TimeoutError, OSError, http.client.HTTPException) as exc:
+        raise CaptureTransient("render_failed") from exc
+    finally:
+        conn.close()
+
+
+def handle_capture_route(route, blocked: dict, *, resolver=None, fetch=None) -> None:
+    """Abort a blocked request, or fulfill it from a pinned connection.
+
+    ``route.continue_()`` is only used for non-network URLs (data/blob/about).
+    Every HTTP(S) request is re-resolved here and served by ``fetch``, so
+    Chromium cannot connect to an address this process did not just validate.
+    """
+    request = route.request
+    try:
+        scheme = (urlparse(getattr(request, "url", "") or "").scheme or "").lower()
+        if scheme in _NON_NETWORK_SCHEMES:
+            route.continue_()
+            return
+        ensure_request_allowed(request.url, resolver=resolver)
+        fetcher = fetch if fetch is not None else fetch_pinned_response
+        body = getattr(request, "post_data_buffer", None)
+        if body is None:
+            posted = getattr(request, "post_data", None)
+            if isinstance(posted, str):
+                body = posted.encode("utf-8")
+            elif isinstance(posted, bytes):
+                body = posted
+        status, response_headers, response_body = fetcher(
+            getattr(request, "method", None) or "GET",
+            request.url,
+            dict(getattr(request, "headers", None) or {}),
+            body,
+            resolver=resolver,
+        )
+        route.fulfill(status=status, headers=response_headers, body=response_body)
+    except CaptureRejected:
+        if _is_top_level_document(request):
+            blocked["document"] = True
+        route.abort()
+    except Exception:
+        route.abort()
+
+
 def capture_screenshot_bytes(url: str) -> bytes:
     """Validate ``url`` and return a viewport JPEG. Safe to run off the event loop."""
     normalized = validate_capture_url(url)
@@ -248,19 +448,12 @@ def render_page_screenshot(url: str) -> bytes:
         raise CaptureRejected("render_unavailable") from exc
 
     timeout_ms = max(1, int(CAPTURE_RENDER_TIMEOUT_SEC * 1000))
-    cache: dict[str, list[str]] = {}
-
-    def cached_resolve(host: str) -> list[str]:
-        if host not in cache:
-            cache[host] = resolve_host(host)
-        return cache[host]
-
     blocked = {"document": False}
     try:
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(
                 headless=True,
-                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+                args=list(CHROMIUM_LAUNCH_ARGS),
             )
             context = browser.new_context(
                 viewport={
@@ -274,23 +467,7 @@ def render_page_screenshot(url: str) -> bytes:
             page.set_default_timeout(timeout_ms)
 
             def guard(route) -> None:
-                request = route.request
-                try:
-                    ensure_request_allowed(request.url, resolver=cached_resolve)
-                except CaptureRejected:
-                    is_document = request.resource_type == "document"
-                    is_navigation = False
-                    checker = getattr(request, "is_navigation_request", None)
-                    if callable(checker):
-                        is_navigation = bool(checker())
-                    if is_document or is_navigation:
-                        blocked["document"] = True
-                    route.abort()
-                    return
-                except CaptureTransient:
-                    route.abort()
-                    return
-                route.continue_()
+                handle_capture_route(route, blocked)
 
             page.route("**/*", guard)
             try:
