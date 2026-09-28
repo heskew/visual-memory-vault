@@ -19,6 +19,8 @@ from frontend.main import (
     PersistError,
     _upload_ingest_prompt,
     load_job,
+    load_stitch_media_bytes,
+    load_uploaded_image_bytes,
 )
 from frontend.stitch import (
     STITCH_MAX_IMAGE_BYTES,
@@ -682,3 +684,203 @@ async def test_stitch_requires_api_key_when_configured(stitch_env, monkeypatch):
 def test_encoded_cap_constant_is_twelve_mib():
     assert STITCH_MAX_OUTPUT_BYTES == 12 * 1024 * 1024
     assert STITCH_MAX_OUTPUT_HEIGHT == 65535
+
+
+class _GcsBlob:
+    def __init__(self, name: str):
+        self.name = name
+        self._data: bytes | str | None = None
+        self.generation = 0
+        self.fail_exists = False
+        self.fail_download = False
+        self.exists_calls = 0
+        self.download_calls = 0
+
+    def exists(self) -> bool:
+        self.exists_calls += 1
+        if self.fail_exists:
+            raise RuntimeError("gcs blip")
+        return self._data is not None
+
+    def reload(self) -> None:
+        return None
+
+    def download_as_text(self) -> str:
+        if isinstance(self._data, bytes):
+            return self._data.decode()
+        return self._data or ""
+
+    def download_as_bytes(self) -> bytes:
+        self.download_calls += 1
+        if self.fail_download:
+            raise RuntimeError("gcs blip")
+        if self._data is None:
+            raise RuntimeError("missing")
+        if isinstance(self._data, str):
+            return self._data.encode()
+        return self._data
+
+    def upload_from_string(
+        self,
+        payload: bytes | str,
+        content_type: str | None = None,
+        if_generation_match: int | None = None,
+    ) -> None:
+        current_gen = self.generation if self._data is not None else 0
+        if if_generation_match is not None and current_gen != if_generation_match:
+            from google.api_core.exceptions import PreconditionFailed
+
+            raise PreconditionFailed("generation mismatch")
+        self._data = payload
+        self.generation = current_gen + 1
+
+
+class _GcsBucket:
+    def __init__(self) -> None:
+        self.blobs: dict[str, _GcsBlob] = {}
+
+    def blob(self, name: str) -> _GcsBlob:
+        if name not in self.blobs:
+            self.blobs[name] = _GcsBlob(name)
+        return self.blobs[name]
+
+    def list_blobs(self, prefix: str = ""):
+        return [
+            blob
+            for name, blob in self.blobs.items()
+            if name.startswith(prefix) and blob._data is not None
+        ]
+
+
+class _Gcs:
+    def __init__(self) -> None:
+        self._bucket = _GcsBucket()
+
+    def bucket(self, _name: str) -> _GcsBucket:
+        return self._bucket
+
+
+def test_stitch_loader_splits_gcs_blip_from_confirmed_missing(tmp_path, monkeypatch):
+    monkeypatch.setattr("frontend.main.MEDIA_DIR", str(tmp_path))
+    monkeypatch.setattr("frontend.main.GCS_BUCKET_NAME", "stitch-bucket")
+    gcs = _Gcs()
+    monkeypatch.setattr("frontend.main._get_gcs_client", lambda: gcs)
+    blob = gcs.bucket("stitch-bucket").blob("vault-images/source.jpg")
+    blob.upload_from_string(b"jpeg-bytes")
+    assert load_stitch_media_bytes("source.jpg") == b"jpeg-bytes"
+
+    blob.fail_download = True
+    with pytest.raises(StitchTransient) as exc:
+        load_stitch_media_bytes("source.jpg")
+    assert exc.value.reason == "gcs_read_failed"
+    assert load_uploaded_image_bytes("source.jpg") is None
+
+    blob.fail_download = False
+    blob.fail_exists = True
+    with pytest.raises(StitchTransient) as exc:
+        load_stitch_media_bytes("source.jpg")
+    assert exc.value.reason == "gcs_read_failed"
+
+    blob.fail_exists = False
+    blob._data = None
+    assert load_stitch_media_bytes("source.jpg") is None
+
+    local = tmp_path / "local.jpg"
+    local.write_bytes(b"local-bytes")
+
+    def broken_open(*_args, **_kwargs):
+        raise OSError("disk blip")
+
+    monkeypatch.setattr("builtins.open", broken_open)
+    with pytest.raises(StitchTransient) as exc:
+        load_stitch_media_bytes("local.jpg")
+    assert exc.value.reason == "gcs_read_failed"
+
+
+@pytest.mark.asyncio
+async def test_gcs_source_blip_stays_pending_and_missing_source_fails(
+    stitch_env, monkeypatch
+):
+    """Scale-to-zero reads sources from GCS. A blip retries; absence is terminal."""
+    gcs = _Gcs()
+    monkeypatch.setattr("frontend.main.GCS_BUCKET_NAME", "stitch-bucket")
+    monkeypatch.setattr("frontend.main.CLOUD_TASKS_QUEUE", "vault-ingest")
+    monkeypatch.setattr("frontend.main._get_gcs_client", lambda: gcs)
+    monkeypatch.setattr("frontend.main.create_ingest_cloud_task", lambda _job_id: None)
+    composed = {"n": 0}
+    real = stitch_mod.compose_vertical_jpeg
+
+    def counting(parts):
+        composed["n"] += 1
+        return real(parts)
+
+    monkeypatch.setattr(stitch_mod, "compose_vertical_jpeg", counting)
+
+    async def succeed(*_args, **_kwargs):
+        return "Stored after the bucket recovered"
+
+    monkeypatch.setattr("frontend.main.ingest_uploaded_image", succeed)
+    jpeg = _solid(4, 4, (12, 12, 12))
+    from frontend.main import app
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        accepted = await client.post("/capture/stitch", files=_parts(jpeg, jpeg)[0])
+        assert accepted.status_code == 202
+        job_id = accepted.json()["job_id"]
+        record = load_job(job_id)
+        ids = list(record["source_image_ids"])
+        output_name = record["image_name"]
+        source_names = [item["image_name"] for item in record["source_images"]]
+        for name in source_names:
+            (stitch_env / name).unlink()
+
+        output_blob = gcs.bucket("stitch-bucket").blob(f"vault-images/{output_name}")
+        output_blob.fail_exists = True
+        monkeypatch.setattr("frontend.main._ingest_in_flight", set())
+        output_blip = await client.post("/ingest", json={"job_id": job_id})
+        assert output_blip.status_code == 503
+        assert output_blob.exists_calls >= 1
+        assert composed["n"] == 0
+        assert load_job(job_id)["status"] == "pending"
+        assert load_job(job_id)["error"] is None
+        assert load_job(job_id)["source_image_ids"] == ids
+        output_blob.fail_exists = False
+
+        source_blob = gcs.bucket("stitch-bucket").blob(
+            f"vault-images/{source_names[0]}"
+        )
+        source_blob.fail_download = True
+        monkeypatch.setattr("frontend.main._ingest_in_flight", set())
+        source_blip = await client.post("/ingest", json={"job_id": job_id})
+        assert source_blip.status_code == 503
+        assert source_blob.download_calls >= 1
+        assert composed["n"] == 0
+        assert load_job(job_id)["status"] == "pending"
+        assert load_job(job_id)["error"] is None
+        assert load_job(job_id)["source_image_ids"] == ids
+        source_blob.fail_download = False
+
+        monkeypatch.setattr("frontend.main._ingest_in_flight", set())
+        recovered = await client.post("/ingest", json={"job_id": job_id})
+        assert recovered.status_code == 200
+        assert composed["n"] == 1
+        assert (await client.get(f"/jobs/{job_id}")).json()["status"] == "succeeded"
+        assert load_job(job_id)["source_image_ids"] == ids
+
+        missing = await client.post("/capture/stitch", files=_parts(jpeg, jpeg)[0])
+        missing_id = missing.json()["job_id"]
+        missing_record = load_job(missing_id)
+        gone_name = missing_record["source_images"][0]["image_name"]
+        (stitch_env / gone_name).unlink()
+        (stitch_env / missing_record["source_images"][1]["image_name"]).unlink()
+        gone_blob = gcs.bucket("stitch-bucket").blob(f"vault-images/{gone_name}")
+        gone_blob._data = None
+        monkeypatch.setattr("frontend.main._ingest_in_flight", set())
+        failed = await client.post("/ingest", json={"job_id": missing_id})
+        assert failed.status_code == 200
+        assert failed.json()["completed"] == [missing_id]
+        body = (await client.get(f"/jobs/{missing_id}")).json()
+        assert body["status"] == "failed"
+        assert body["error"] == "stitch_source_missing"
+        assert composed["n"] == 1

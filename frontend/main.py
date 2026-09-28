@@ -868,6 +868,10 @@ def claim_ingest_job(job_id: str) -> dict | None:
 
 
 def load_uploaded_image_bytes(image_name: str) -> bytes | None:
+    """Best-effort image load. GCS errors return None, same as a missing object.
+
+    Stitch must tell those apart; use ``load_stitch_media_bytes`` there.
+    """
     local_path = os.path.join(MEDIA_DIR, image_name)
     if os.path.exists(local_path):
         with open(local_path, "rb") as f:
@@ -883,6 +887,49 @@ def load_uploaded_image_bytes(image_name: str) -> bytes | None:
         except Exception as e:
             print(f"Warning: Failed to load image for ingest job: {e}")
     return None
+
+
+def load_stitch_media_bytes(image_name: str) -> bytes | None:
+    """Load one stitch source or the composed JPEG.
+
+    Returns None only when the object is confirmed absent. A local IO error or
+    a GCS read/exists failure raises ``StitchTransient`` (``gcs_read_failed``)
+    so the job stays pending. Upload and URL capture keep using
+    ``load_uploaded_image_bytes``.
+    """
+    local_path = os.path.join(MEDIA_DIR, image_name)
+    try:
+        local_exists = os.path.exists(local_path)
+    except OSError as exc:
+        print(f"Warning: Failed to stat stitch image {image_name}: {exc}")
+        raise stitch_mod.StitchTransient("gcs_read_failed") from exc
+    if local_exists:
+        try:
+            with open(local_path, "rb") as handle:
+                return handle.read()
+        except OSError as exc:
+            print(f"Warning: Failed to read stitch image {image_name}: {exc}")
+            raise stitch_mod.StitchTransient("gcs_read_failed") from exc
+
+    if not GCS_BUCKET_NAME:
+        return None
+
+    try:
+        gcs = _get_gcs_client()
+        if not gcs:
+            raise stitch_mod.StitchTransient("gcs_read_failed")
+        blob = gcs.bucket(GCS_BUCKET_NAME).blob(f"vault-images/{image_name}")
+        if not blob.exists():
+            return None
+        payload = blob.download_as_bytes()
+    except stitch_mod.StitchTransient:
+        raise
+    except Exception as exc:
+        print(f"Warning: Failed to load stitch image {image_name}: {exc}")
+        raise stitch_mod.StitchTransient("gcs_read_failed") from exc
+    if payload is None:
+        raise stitch_mod.StitchTransient("gcs_read_failed")
+    return payload
 
 
 def list_pending_ingest_jobs() -> list[dict]:
@@ -1027,7 +1074,9 @@ async def _ensure_stitched_image(claimed: dict) -> dict:
 
     Upload and URL jobs return unchanged. A JPEG already in the durable store
     is not composed again, so a Cloud Tasks retry continues at extract.
-    Source ids are the ones minted at accept time.
+    Source ids are the ones minted at accept time. A GCS or IO blip while
+    reading the composed JPEG or a source stays pending; only a confirmed-absent
+    source is ``stitch_source_missing``.
     """
     if claimed.get("capture_kind") != "stitch":
         return claimed
@@ -1045,7 +1094,7 @@ async def _ensure_stitched_image(claimed: dict) -> dict:
         raise stitch_mod.StitchRejected("too_many_images")
     if len(sources) != len(source_ids):
         raise stitch_mod.StitchRejected("stitch_source_missing")
-    if load_uploaded_image_bytes(image_name):
+    if load_stitch_media_bytes(image_name):
         if not claimed.get("captured_at"):
             claimed["captured_at"] = stitch_mod.utc_now()
             claimed["capture_rendered"] = True
@@ -1055,8 +1104,8 @@ async def _ensure_stitched_image(claimed: dict) -> dict:
     for source, source_id in zip(sources, source_ids, strict=True):
         if not isinstance(source, dict) or source.get("id") != source_id:
             raise stitch_mod.StitchRejected("stitch_source_missing")
-        data = load_uploaded_image_bytes(_safe_media_name(source.get("image_name")))
-        if not data:
+        data = load_stitch_media_bytes(_safe_media_name(source.get("image_name")))
+        if data is None:
             raise stitch_mod.StitchRejected("stitch_source_missing")
         blobs.append(data)
     try:
@@ -1107,10 +1156,17 @@ async def process_ingest_job(job: dict) -> dict:
     if claimed is None:
         return load_job(job_id) or job
     _ingest_in_flight.add(job_id)
+    stitch_bytes: bytes | None = None
     try:
         try:
             claimed = await _ensure_url_screenshot(claimed)
             claimed = await _ensure_stitched_image(claimed)
+            if claimed.get("capture_kind") == "stitch":
+                stitch_bytes = load_stitch_media_bytes(
+                    _safe_media_name(claimed.get("image_name"))
+                )
+                if not stitch_bytes:
+                    raise stitch_mod.StitchRejected("image_missing")
         except capture_mod.CaptureRejected as exc:
             print(f"Error: capture job {job_id} rejected: {exc.reason}")
             return _mark_job_failed(claimed, _safe_reason(exc.reason))
@@ -1126,9 +1182,12 @@ async def process_ingest_job(job: dict) -> dict:
         except (PersistError, EnqueueError) as exc:
             print(f"Warning: transient capture persist error for {job_id}: {exc}")
             return _release_job_for_retry(claimed)
-        data = load_uploaded_image_bytes(claimed["image_name"])
-        if not data:
-            return _mark_job_failed(claimed, "image_missing")
+        if stitch_bytes is None:
+            data = load_uploaded_image_bytes(claimed["image_name"])
+            if not data:
+                return _mark_job_failed(claimed, "image_missing")
+        else:
+            data = stitch_bytes
         try:
             ingest_kwargs = {}
             if claimed.get("capture_kind") == "url":
