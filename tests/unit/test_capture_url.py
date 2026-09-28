@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
 import io
 import json
 import socket
+import sys
+import types
+import zlib
 from pathlib import Path
 
 import httpx
@@ -16,6 +20,7 @@ from PIL import Image
 from frontend import capture as capture_mod
 from frontend.capture import (
     CHROMIUM_LAUNCH_ARGS,
+    WEBRTC_DISABLE_SCRIPT,
     CaptureRejected,
     CaptureTransient,
     capture_store_metadata,
@@ -23,6 +28,7 @@ from frontend.capture import (
     fetch_pinned_response,
     handle_capture_route,
     pin_public_address,
+    pin_public_addresses,
     validate_capture_url,
 )
 from frontend.main import (
@@ -32,6 +38,7 @@ from frontend.main import (
 )
 
 _REAL_RESOLVE = capture_mod.resolve_host
+_REAL_RENDER = capture_mod.render_page_screenshot
 
 _PUBLIC = ["93.184.216.34"]
 
@@ -717,7 +724,333 @@ def test_connect_time_rebinding_does_not_open_a_socket(monkeypatch):
 def test_chromium_cannot_resolve_on_its_own():
     assert "--disable-quic" in CHROMIUM_LAUNCH_ARGS
     assert "--dns-prefetch-disable" in CHROMIUM_LAUNCH_ARGS
-    assert any(
-        arg.startswith("--disable-features=") and "WebRTC" in arg
+    assert (
+        "--force-webrtc-ip-handling-policy=disable_non_proxied_udp"
+        in CHROMIUM_LAUNCH_ARGS
+    )
+    assert not any(
+        arg == "--disable-features=WebRTC" or arg.endswith("=WebRTC")
         for arg in CHROMIUM_LAUNCH_ARGS
     )
+    for name in ("RTCPeerConnection", "webkitRTCPeerConnection"):
+        assert name in WEBRTC_DISABLE_SCRIPT
+
+
+def test_render_disables_webrtc_before_page_scripts(monkeypatch):
+    launched: dict = {}
+
+    class _Page:
+        def set_default_navigation_timeout(self, _ms):
+            return None
+
+        def set_default_timeout(self, _ms):
+            return None
+
+        def route(self, _pattern, _handler):
+            return None
+
+        def goto(self, _url, wait_until=None, timeout=None):
+            return None
+
+        def screenshot(self, type=None, quality=None, full_page=None):
+            return b"jpeg-bytes"
+
+    class _Context:
+        def __init__(self):
+            self.scripts: list[str] = []
+
+        def add_init_script(self, script):
+            self.scripts.append(script)
+
+        def new_page(self):
+            return _Page()
+
+    class _Browser:
+        def new_context(self, **_kwargs):
+            context = _Context()
+            launched["context"] = context
+            return context
+
+    class _Chromium:
+        def launch(self, headless=None, args=None):
+            launched["args"] = list(args or [])
+            return _Browser()
+
+    class _Playwright:
+        def __init__(self):
+            self.chromium = _Chromium()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+    sync_api = types.ModuleType("playwright.sync_api")
+    sync_api.TimeoutError = type("PlaywrightTimeout", (Exception,), {})
+    sync_api.sync_playwright = lambda: _Playwright()
+    package = types.ModuleType("playwright")
+    package.sync_api = sync_api
+    monkeypatch.setitem(sys.modules, "playwright", package)
+    monkeypatch.setitem(sys.modules, "playwright.sync_api", sync_api)
+
+    assert _REAL_RENDER("https://example.com/") == b"jpeg-bytes"
+    assert "--disable-quic" in launched["args"]
+    assert (
+        "--force-webrtc-ip-handling-policy=disable_non_proxied_udp" in launched["args"]
+    )
+    assert "--disable-features=WebRTC" not in launched["args"]
+    assert WEBRTC_DISABLE_SCRIPT in launched["context"].scripts
+
+
+_V6 = "2606:4700:4700::1111"
+_V4 = "93.184.216.34"
+
+
+def test_aaaa_first_prefers_ipv4_when_ipv6_egress_is_down():
+    def resolver(_host: str) -> list[str]:
+        return [_V6, _V4]
+
+    assert pin_public_addresses("example.com", resolver=resolver, ipv6_ok=False) == [
+        _V4,
+        _V6,
+    ]
+    assert pin_public_address("example.com", resolver=resolver, ipv6_ok=False) == _V4
+
+
+def test_aaaa_first_keeps_dns_order_when_ipv6_egress_works():
+    def resolver(_host: str) -> list[str]:
+        return [_V6, _V4]
+
+    assert pin_public_addresses("example.com", resolver=resolver, ipv6_ok=True) == [
+        _V6,
+        _V4,
+    ]
+
+
+def test_ipv6_only_public_name_is_not_replaced():
+    def resolver(_host: str) -> list[str]:
+        return [_V6]
+
+    assert pin_public_address("example.com", resolver=resolver, ipv6_ok=False) == _V6
+
+
+def test_pin_rejects_aaaa_mixed_with_a_private_answer(monkeypatch):
+    def connect(*_args, **_kwargs):
+        raise AssertionError("mixed answer must not dial")
+
+    monkeypatch.setattr("frontend.capture.socket.create_connection", connect)
+
+    def resolver(_host: str) -> list[str]:
+        return [_V6, "10.0.0.1"]
+
+    with pytest.raises(CaptureRejected) as exc:
+        pin_public_address("example.com", resolver=resolver, ipv6_ok=False)
+    assert exc.value.reason == "blocked_url"
+
+
+def test_fetch_does_not_dial_when_any_answer_is_private(monkeypatch):
+    connected = {"yes": False}
+
+    def connect(*_args, **_kwargs):
+        connected["yes"] = True
+        raise AssertionError("private answer must not dial")
+
+    monkeypatch.setattr("frontend.capture.socket.create_connection", connect)
+    with pytest.raises(CaptureRejected) as exc:
+        fetch_pinned_response(
+            "GET",
+            "https://example.com/",
+            None,
+            None,
+            resolver=lambda _host: [_V6, "169.254.169.254"],
+            ipv6_ok=True,
+        )
+    assert exc.value.reason == "blocked_url"
+    assert connected["yes"] is False
+
+
+def test_pinned_fetch_falls_back_from_unreachable_ipv6(monkeypatch):
+    seen: list[tuple] = []
+
+    def connect(address, timeout=None, source_address=None):
+        seen.append(address)
+        if address[0] == _V6:
+            raise OSError(101, "Network is unreachable")
+        raise TimeoutError("stop after ipv4")
+
+    monkeypatch.setattr("frontend.capture.socket.create_connection", connect)
+    with pytest.raises(CaptureTransient):
+        fetch_pinned_response(
+            "GET",
+            "https://example.com/docs",
+            {"Accept-Encoding": "gzip, deflate, br"},
+            None,
+            resolver=lambda _host: [_V6, _V4],
+            ipv6_ok=True,
+        )
+    assert seen == [(_V6, 443), (_V4, 443)]
+
+
+def test_pinned_fetch_dials_ipv4_first_without_ipv6_egress(monkeypatch):
+    seen: list[tuple] = []
+
+    def connect(address, timeout=None, source_address=None):
+        seen.append(address)
+        raise TimeoutError("stop")
+
+    monkeypatch.setattr("frontend.capture.socket.create_connection", connect)
+    with pytest.raises(CaptureTransient):
+        fetch_pinned_response(
+            "GET",
+            "https://example.com/docs",
+            None,
+            None,
+            resolver=lambda _host: [_V6, _V4],
+            ipv6_ok=False,
+        )
+    assert seen[0] == (_V4, 443)
+    assert (_V6, 443) in seen
+
+
+class _PinnedResponse:
+    def __init__(self, status, headers, body):
+        self.status = status
+        self._headers = headers
+        self._body = body
+        self._pos = 0
+
+    def getheaders(self):
+        return list(self._headers)
+
+    def read(self, size):
+        if self._pos >= len(self._body):
+            return b""
+        chunk = self._body[self._pos : self._pos + size]
+        self._pos += size
+        return chunk
+
+
+class _PinnedConn:
+    def __init__(self, host, port, timeout=None):
+        self.host = host
+        self.port = port
+        self.sent_headers = None
+
+    def request(self, method, path, body=None, headers=None):
+        self.sent_headers = dict(headers or {})
+
+    def close(self):
+        return None
+
+
+def _patch_pinned_conn(monkeypatch, response: _PinnedResponse):
+    sent = {}
+
+    class Conn(_PinnedConn):
+        def request(self, method, path, body=None, headers=None):
+            super().request(method, path, body=body, headers=headers)
+            sent["headers"] = self.sent_headers
+
+        def getresponse(self):
+            return response
+
+    monkeypatch.setattr("frontend.capture.http.client.HTTPSConnection", Conn)
+    return sent
+
+
+def test_gzip_body_is_decoded_before_fulfill(monkeypatch):
+    plain = b"<html>ok</html>"
+    sent = _patch_pinned_conn(
+        monkeypatch,
+        _PinnedResponse(
+            200,
+            [
+                ("Content-Encoding", "gzip"),
+                ("Content-Type", "text/html"),
+                ("Content-Length", "99"),
+            ],
+            gzip.compress(plain),
+        ),
+    )
+    status, headers, body = fetch_pinned_response(
+        "GET",
+        "https://example.com/docs",
+        {"Accept-Encoding": "gzip, deflate, br, zstd", "User-Agent": "Mozilla"},
+        None,
+        resolver=lambda _host: [_V4],
+        ipv6_ok=True,
+    )
+    assert status == 200
+    assert body == plain
+    assert all(key.lower() != "content-encoding" for key in headers)
+    assert all(key.lower() != "content-length" for key in headers)
+    assert headers["Content-Type"] == "text/html"
+    assert sent["headers"]["Accept-Encoding"] == "identity"
+    assert "gzip" not in sent["headers"]["Accept-Encoding"]
+
+
+def test_deflate_body_is_decoded_before_fulfill(monkeypatch):
+    plain = b"<html>deflate</html>"
+    _patch_pinned_conn(
+        monkeypatch,
+        _PinnedResponse(
+            200,
+            [("Content-Encoding", "deflate"), ("Content-Type", "text/html")],
+            zlib.compress(plain),
+        ),
+    )
+    _status, headers, body = fetch_pinned_response(
+        "GET",
+        "https://example.com/",
+        None,
+        None,
+        resolver=lambda _host: [_V4],
+        ipv6_ok=True,
+    )
+    assert body == plain
+    assert all(key.lower() != "content-encoding" for key in headers)
+
+
+def test_raw_deflate_body_is_decoded_before_fulfill(monkeypatch):
+    plain = b"<html>raw</html>"
+    compressor = zlib.compressobj(wbits=-zlib.MAX_WBITS)
+    raw = compressor.compress(plain) + compressor.flush()
+    _patch_pinned_conn(
+        monkeypatch,
+        _PinnedResponse(
+            200,
+            [("Content-Encoding", "deflate")],
+            raw,
+        ),
+    )
+    _status, _headers, body = fetch_pinned_response(
+        "GET",
+        "https://example.com/",
+        None,
+        None,
+        resolver=lambda _host: [_V4],
+        ipv6_ok=True,
+    )
+    assert body == plain
+
+
+def test_unsupported_content_encoding_is_not_fulfilled(monkeypatch):
+    _patch_pinned_conn(
+        monkeypatch,
+        _PinnedResponse(
+            200,
+            [("Content-Encoding", "br"), ("Content-Type", "text/html")],
+            b"\x8b not brotli",
+        ),
+    )
+    with pytest.raises(CaptureTransient) as exc:
+        fetch_pinned_response(
+            "GET",
+            "https://example.com/",
+            {"Accept-Encoding": "br"},
+            None,
+            resolver=lambda _host: [_V4],
+            ipv6_ok=True,
+        )
+    assert exc.value.reason == "render_failed"

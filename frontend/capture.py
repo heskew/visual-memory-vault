@@ -11,12 +11,14 @@ upload path.
 
 from __future__ import annotations
 
+import gzip
 import http.client
 import ipaddress
 import os
 import re
 import socket
 import threading
+import zlib
 from datetime import UTC, datetime
 from urllib.parse import urlparse
 
@@ -27,16 +29,43 @@ CAPTURE_VIEWPORT_WIDTH = 1280
 CAPTURE_VIEWPORT_HEIGHT = 720
 CAPTURE_JPEG_QUALITY = 80
 CAPTURE_MAX_SUBRESOURCE_BYTES = 8 * 1024 * 1024
-# Chromium must not open its own sockets. QUIC and WebRTC bypass an HTTP
-# route handler; DNS prefetch would resolve names the worker never checked.
+# Chromium must not open its own sockets. QUIC bypasses an HTTP route
+# handler; DNS prefetch would resolve names the worker never checked.
+# ``--disable-features=WebRTC`` is not a Chromium feature name, so it leaves
+# RTCPeerConnection enabled. ``disable_non_proxied_udp`` is the real IP-handling
+# preference: no non-proxied UDP, which stops STUN/TURN/ICE UDP sockets.
+# Page script also loses the peer-connection constructors (see
+# WEBRTC_DISABLE_SCRIPT) so TCP ICE cannot bypass the pinned route either.
 CHROMIUM_LAUNCH_ARGS = (
     "--no-sandbox",
     "--disable-dev-shm-usage",
     "--disable-gpu",
     "--disable-quic",
     "--dns-prefetch-disable",
-    "--disable-features=WebRTC",
+    "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
 )
+# Runs in every frame before page scripts. Shadowing the constructors stops
+# a page from opening STUN/TURN/ICE sockets that Playwright's HTTP route
+# never sees. Feature detection treats the API as missing.
+WEBRTC_DISABLE_SCRIPT = """
+(() => {
+  const names = [
+    "RTCPeerConnection",
+    "webkitRTCPeerConnection",
+    "mozRTCPeerConnection",
+  ];
+  for (const name of names) {
+    try {
+      Object.defineProperty(window, name, {
+        configurable: false,
+        enumerable: false,
+        writable: false,
+        value: undefined,
+      });
+    } catch (e) {}
+  }
+})();
+"""
 _HOP_BY_HOP = frozenset(
     {
         "connection",
@@ -71,6 +100,8 @@ _BLOCKED_HOST_SUFFIXES = (
 )
 _LABEL_RE = re.compile(r"(?:0x[0-9a-fA-F]+|\d+)")
 _dns_lock = threading.Lock()
+_ipv6_lock = threading.Lock()
+_ipv6_egress: bool | None = None
 
 
 class CaptureRejected(Exception):
@@ -176,7 +207,11 @@ def resolve_host(host: str) -> list[str]:
         previous = socket.getdefaulttimeout()
         try:
             socket.setdefaulttimeout(5.0)
-            infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+            # Drop address families this host has not configured. Ordering
+            # and connect fallback still handle a dual-stack answer that
+            # includes an unreachable family.
+            flags = getattr(socket, "AI_ADDRCONFIG", 0)
+            infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM, flags=flags)
         except TimeoutError as exc:
             raise CaptureTransient("dns_unavailable") from exc
         except socket.gaierror as exc:
@@ -257,12 +292,50 @@ def ensure_request_allowed(url: str, *, resolver=None) -> None:
     validate_capture_url(url, resolver=resolver, limit_length=False)
 
 
-def pin_public_address(host: str, *, resolver=None) -> str:
-    """Fresh public IP for ``host``. Never reuse an earlier lookup.
+def ipv6_egress_available() -> bool:
+    """True when this host has a route for public IPv6.
+
+    A UDP connect does not send a packet; it fails immediately when the
+    host has no IPv6 route (typical Cloud Run IPv4 egress). The result is
+    about this machine's routing, not a DNS answer, and is cached for the
+    process. It is not a record of which capture hosts are allowed.
+    """
+    global _ipv6_egress
+    if _ipv6_egress is not None:
+        return _ipv6_egress
+    with _ipv6_lock:
+        if _ipv6_egress is not None:
+            return _ipv6_egress
+        probe = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+        try:
+            probe.connect(("2001:4860:4860::8888", 53))
+        except OSError:
+            _ipv6_egress = False
+        else:
+            _ipv6_egress = True
+        finally:
+            probe.close()
+        return _ipv6_egress
+
+
+def _order_public_addresses(addresses: list[str], *, ipv6_ok: bool) -> list[str]:
+    """Prefer IPv4 when this host cannot use IPv6. Keep DNS order otherwise."""
+    if ipv6_ok:
+        return list(addresses)
+    v4 = [address for address in addresses if ":" not in address]
+    v6 = [address for address in addresses if ":" in address]
+    return v4 + v6
+
+
+def pin_public_addresses(
+    host: str, *, resolver=None, ipv6_ok: bool | None = None
+) -> list[str]:
+    """Fresh public IPs for ``host``. Never reuse an earlier lookup.
 
     A name that resolves to any non-global address is rejected, even when
-    another answer is public. The returned address is the only one a later
-    connect may use.
+    another answer is public. Every returned address passed that check.
+    When IPv6 egress is unavailable, IPv4 answers come first so a dual-stack
+    name that returns AAAA first is not stuck on an unreachable family.
     """
     normalized = (host or "").lower().rstrip(".")
     if not normalized:
@@ -273,21 +346,31 @@ def pin_public_address(host: str, *, resolver=None) -> str:
     if literal is not None:
         if _ip_is_blocked(literal):
             raise CaptureRejected("blocked_url")
-        return str(literal)
+        return [str(literal)]
     lookup = resolver or resolve_host
-    chosen: str | None = None
+    public: list[str] = []
     for address in lookup(normalized):
         try:
             parsed = ipaddress.ip_address(str(address).split("%", 1)[0])
         except ValueError as exc:
             raise CaptureRejected("bad_url") from exc
+        if isinstance(parsed, ipaddress.IPv6Address) and parsed.ipv4_mapped is not None:
+            parsed = parsed.ipv4_mapped
         if _ip_is_blocked(parsed):
             raise CaptureRejected("blocked_url")
-        if chosen is None:
-            chosen = str(parsed)
-    if chosen is None:
+        text = str(parsed)
+        if text not in public:
+            public.append(text)
+    if not public:
         raise CaptureRejected("bad_url")
-    return chosen
+    if ipv6_ok is None:
+        ipv6_ok = ipv6_egress_available()
+    return _order_public_addresses(public, ipv6_ok=ipv6_ok)
+
+
+def pin_public_address(host: str, *, resolver=None, ipv6_ok: bool | None = None) -> str:
+    """First public IP ``pin_public_addresses`` would dial for ``host``."""
+    return pin_public_addresses(host, resolver=resolver, ipv6_ok=ipv6_ok)[0]
 
 
 def _is_top_level_document(request) -> bool:
@@ -313,6 +396,115 @@ def _is_top_level_document(request) -> bool:
     return getattr(frame, "parent_frame", None) is None
 
 
+def _inflate_content_encoding(encoding: str, body: bytes) -> bytes:
+    """Return uncompressed bytes. Unknown encodings are not passed through."""
+    try:
+        if encoding in {"gzip", "x-gzip"}:
+            return gzip.decompress(body)
+        if encoding == "deflate":
+            try:
+                return zlib.decompress(body)
+            except zlib.error:
+                return zlib.decompress(body, -zlib.MAX_WBITS)
+    except (OSError, zlib.error, ValueError) as exc:
+        raise CaptureTransient("render_failed") from exc
+    raise CaptureTransient("render_failed")
+
+
+def _decode_for_fulfill(
+    header_pairs: list[tuple[str, str]], body: bytes
+) -> tuple[dict[str, str], bytes]:
+    """Playwright fulfill wants decoded bytes and no Content-Encoding.
+
+    ``http.client`` already removes chunked transfer encoding. Content-Length
+    is dropped with the other hop-by-hop headers because decompression changes
+    the size.
+    """
+    encodings: list[str] = []
+    kept: dict[str, str] = {}
+    for key, value in header_pairs:
+        lowered = key.lower()
+        if lowered in _HOP_BY_HOP:
+            continue
+        if lowered == "content-encoding":
+            encodings.extend(
+                part.strip().lower() for part in value.split(",") if part.strip()
+            )
+            continue
+        kept[key] = value
+    for encoding in encodings:
+        if encoding in {"", "identity"}:
+            continue
+        body = _inflate_content_encoding(encoding, body)
+    return kept, body
+
+
+def _outbound_headers(headers: dict | None) -> dict[str, str]:
+    """Copy request headers, but ask for an uncompressed body.
+
+    Chromium's ``Accept-Encoding`` (gzip, brotli, zstd) would make the origin
+    return bytes Playwright cannot fulfill. ``identity`` keeps the SSRF pin
+    and matches what common public sites send when compression is refused.
+    """
+    outbound: dict[str, str] = {}
+    for key, value in (headers or {}).items():
+        lowered = key.lower()
+        if (
+            lowered in _HOP_BY_HOP
+            or lowered.startswith(":")
+            or lowered == "accept-encoding"
+        ):
+            continue
+        outbound[key] = value
+    outbound["Accept-Encoding"] = "identity"
+    return outbound
+
+
+def _exchange_on_pin(
+    *,
+    scheme: str,
+    ascii_host: str,
+    port: int,
+    ip: str,
+    method: str,
+    path: str,
+    body: bytes | None,
+    headers: dict[str, str],
+) -> tuple[int, dict[str, str], bytes]:
+    """One HTTP(S) exchange whose TCP peer is ``ip`` and whose SNI is the name."""
+    if scheme == "https":
+        conn: http.client.HTTPConnection = http.client.HTTPSConnection(
+            ascii_host, port, timeout=10
+        )
+    else:
+        conn = http.client.HTTPConnection(ascii_host, port, timeout=10)
+
+    def connect_to_pin(address, timeout=None, source_address=None):
+        conn_port = address[1]
+        return socket.create_connection((ip, conn_port), timeout, source_address)
+
+    conn._create_connection = connect_to_pin
+    try:
+        conn.request(method or "GET", path, body=body, headers=headers)
+        response = conn.getresponse()
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = response.read(65536)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > CAPTURE_MAX_SUBRESOURCE_BYTES:
+                raise CaptureTransient("render_failed")
+            chunks.append(chunk)
+        decoded_headers, decoded = _decode_for_fulfill(
+            response.getheaders(), b"".join(chunks)
+        )
+        return response.status, decoded_headers, decoded
+    finally:
+        conn.close()
+
+
 def fetch_pinned_response(
     method: str,
     url: str,
@@ -320,11 +512,14 @@ def fetch_pinned_response(
     body: bytes | None,
     *,
     resolver=None,
+    ipv6_ok: bool | None = None,
 ) -> tuple[int, dict[str, str], bytes]:
-    """HTTP(S) GET/POST connected only to ``pin_public_address``.
+    """HTTP(S) exchange connected only to addresses from a fresh public pin.
 
-    The TCP peer is that IP. TLS still uses the original hostname for SNI
-    and certificate checks. Chromium never resolves this URL itself.
+    The TCP peer is one of those IPs. TLS still uses the original hostname
+    for SNI and certificate checks. Chromium never resolves this URL itself.
+    If the first validated address cannot be dialed, the next validated
+    public address is tried. A private address is never a fallback.
     """
     parsed = urlparse(url)
     scheme = (parsed.scheme or "").lower()
@@ -339,54 +534,30 @@ def fetch_pinned_response(
         raise CaptureRejected("bad_url") from exc
     if port is None:
         port = 443 if scheme == "https" else 80
-    ip = pin_public_address(host, resolver=resolver)
+    candidates = pin_public_addresses(host, resolver=resolver, ipv6_ok=ipv6_ok)
     ascii_host = host.encode("idna").decode("ascii")
-    if scheme == "https":
-        conn: http.client.HTTPConnection = http.client.HTTPSConnection(
-            ascii_host, port, timeout=10
-        )
-    else:
-        conn = http.client.HTTPConnection(ascii_host, port, timeout=10)
-
-    def connect_to_pin(address, timeout=None, source_address=None):
-        conn_port = address[1]
-        return socket.create_connection((ip, conn_port), timeout, source_address)
-
-    conn._create_connection = connect_to_pin
     path = parsed.path or "/"
     if parsed.query:
         path = f"{path}?{parsed.query}"
-    outbound: dict[str, str] = {}
-    for key, value in (headers or {}).items():
-        lowered = key.lower()
-        if lowered in _HOP_BY_HOP or lowered.startswith(":"):
-            continue
-        outbound[key] = value
-    try:
-        conn.request(method or "GET", path, body=body, headers=outbound)
-        response = conn.getresponse()
-        chunks: list[bytes] = []
-        total = 0
-        while True:
-            chunk = response.read(65536)
-            if not chunk:
-                break
-            total += len(chunk)
-            if total > CAPTURE_MAX_SUBRESOURCE_BYTES:
-                raise CaptureTransient("render_failed")
-            chunks.append(chunk)
-        header_map: dict[str, str] = {}
-        for key, value in response.getheaders():
-            if key.lower() in _HOP_BY_HOP:
-                continue
-            header_map[key] = value
-        return response.status, header_map, b"".join(chunks)
-    except (CaptureRejected, CaptureTransient):
-        raise
-    except (TimeoutError, OSError, http.client.HTTPException) as exc:
-        raise CaptureTransient("render_failed") from exc
-    finally:
-        conn.close()
+    outbound = _outbound_headers(headers)
+    last_exc: Exception | None = None
+    for ip in candidates:
+        try:
+            return _exchange_on_pin(
+                scheme=scheme,
+                ascii_host=ascii_host,
+                port=port,
+                ip=ip,
+                method=method or "GET",
+                path=path,
+                body=body,
+                headers=outbound,
+            )
+        except (CaptureRejected, CaptureTransient):
+            raise
+        except (TimeoutError, OSError, http.client.HTTPException) as exc:
+            last_exc = exc
+    raise CaptureTransient("render_failed") from last_exc
 
 
 def handle_capture_route(route, blocked: dict, *, resolver=None, fetch=None) -> None:
@@ -462,6 +633,7 @@ def render_page_screenshot(url: str) -> bytes:
                 },
                 ignore_https_errors=False,
             )
+            context.add_init_script(WEBRTC_DISABLE_SCRIPT)
             page = context.new_page()
             page.set_default_navigation_timeout(timeout_ms)
             page.set_default_timeout(timeout_ms)
