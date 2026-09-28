@@ -14,6 +14,11 @@ from typing import Annotated
 import google.auth
 import google.auth.transport.requests
 import httpx
+
+try:
+    from frontend import capture as capture_mod
+except ImportError:  # python frontend/main.py, or the proxy image's python main.py
+    import capture as capture_mod
 from a2a.client import (
     A2AClientError,
     A2AClientTimeoutError,
@@ -77,6 +82,11 @@ INGEST_TASKS_OIDC_SA = os.environ.get("INGEST_TASKS_OIDC_SA")
 # timeout in ingest_uploaded_image, so a still-running job is not reclaimed by
 # a second worker and processed (and stored) twice. Keep comfortably above 120.
 INGEST_LEASE_SEC = float(os.environ.get("INGEST_LEASE_SEC", "300"))
+# Extra wait so a stuck Chromium is a terminal render_timeout even if Playwright
+# misses its own deadline. The worker thread may still be winding down.
+_CAPTURE_THREAD_SLACK_SEC = 5.0
+_CAPTURE_URL_MAX_CHARS = 8192
+_JOB_ERROR_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 
 if "A2A_BASE_URL" in os.environ:
     A2A_BASE = os.environ["A2A_BASE_URL"]
@@ -605,6 +615,9 @@ def enqueue_ingest_job(
     media_type: str,
     image_path: str,
     subject: str | None,
+    *,
+    source_url: str | None = None,
+    capture_kind: str | None = None,
 ) -> dict:
     """Write a pending job to the durable store. Raises EnqueueError on failure."""
     job = {
@@ -623,6 +636,11 @@ def enqueue_ingest_job(
         "date": None,
         "error": None,
     }
+    if source_url or capture_kind:
+        job["source_url"] = source_url
+        job["capture_kind"] = capture_kind or "url"
+        job["captured_at"] = None
+        job["capture_rendered"] = False
     write_job_record(job)
     schedule_ingest_consumer(job["job_id"])
     return job
@@ -916,6 +934,12 @@ def job_public_view(job: dict) -> dict:
     return view
 
 
+def _safe_reason(reason: str) -> str:
+    if _JOB_ERROR_RE.match(reason or ""):
+        return reason
+    return "bad_url"
+
+
 def _mark_job_failed(job: dict, error: str) -> dict:
     job["status"] = "failed"
     job["error"] = error
@@ -924,6 +948,55 @@ def _mark_job_failed(job: dict, error: str) -> dict:
     except EnqueueError as write_exc:
         print(f"Warning: Failed to persist failed job {job['job_id']}: {write_exc}")
     return job
+
+
+def _release_job_for_retry(job: dict) -> dict:
+    """Drop the lease and leave the job pending. Capture fields stay on the record."""
+    job["status"] = "pending"
+    job["lease_until"] = None
+    try:
+        write_job_record(job)
+    except EnqueueError as write_exc:
+        print(f"Warning: failed to release lease for {job['job_id']}: {write_exc}")
+    return job
+
+
+async def _ensure_url_screenshot(claimed: dict) -> dict:
+    """Render a URL capture onto the reserved media path before extract/store.
+
+    Upload jobs return unchanged. A screenshot already in the durable store is
+    not rendered again, so a Cloud Tasks retry after scale-to-zero continues
+    at extract.
+    """
+    if claimed.get("capture_kind") != "url":
+        return claimed
+    image_name = claimed.get("image_name") or ""
+    source_url = claimed.get("source_url") or ""
+    if not image_name or not source_url:
+        raise capture_mod.CaptureRejected("bad_url")
+    if load_uploaded_image_bytes(image_name):
+        if not claimed.get("captured_at"):
+            claimed["captured_at"] = capture_mod.utc_now()
+            claimed["capture_rendered"] = True
+            write_job_record(claimed)
+        return claimed
+    timeout = capture_mod.CAPTURE_RENDER_TIMEOUT_SEC + _CAPTURE_THREAD_SLACK_SEC
+    try:
+        jpeg = await asyncio.wait_for(
+            asyncio.to_thread(capture_mod.capture_screenshot_bytes, source_url),
+            timeout=timeout,
+        )
+    except TimeoutError as exc:
+        raise capture_mod.CaptureRejected("render_timeout") from exc
+    file_bytes, _filename, media_type = normalize_image(jpeg, "page.jpg", "image/jpeg")
+    if len(file_bytes) > capture_mod.CAPTURE_MAX_IMAGE_BYTES:
+        raise capture_mod.CaptureRejected("render_too_large")
+    persist_uploaded_image(file_bytes, image_name, media_type or "image/jpeg")
+    claimed["media_type"] = media_type or "image/jpeg"
+    claimed["captured_at"] = capture_mod.utc_now()
+    claimed["capture_rendered"] = True
+    write_job_record(claimed)
+    return claimed
 
 
 async def _commit_succeeded_job(job: dict) -> dict:
@@ -961,27 +1034,40 @@ async def process_ingest_job(job: dict) -> dict:
         return load_job(job_id) or job
     _ingest_in_flight.add(job_id)
     try:
+        try:
+            claimed = await _ensure_url_screenshot(claimed)
+        except capture_mod.CaptureRejected as exc:
+            print(f"Error: capture job {job_id} rejected: {exc.reason}")
+            return _mark_job_failed(claimed, _safe_reason(exc.reason))
+        except capture_mod.CaptureTransient as exc:
+            print(f"Warning: transient capture error for {job_id}: {exc.reason}")
+            return _release_job_for_retry(claimed)
+        except (PersistError, EnqueueError) as exc:
+            print(f"Warning: transient capture persist error for {job_id}: {exc}")
+            return _release_job_for_retry(claimed)
         data = load_uploaded_image_bytes(claimed["image_name"])
         if not data:
             return _mark_job_failed(claimed, "image_missing")
         try:
+            ingest_kwargs = {}
+            if claimed.get("capture_kind") == "url":
+                ingest_kwargs["capture"] = capture_mod.capture_store_metadata(
+                    claimed.get("source_url") or "",
+                    claimed.get("captured_at") or "",
+                    claimed.get("image_path") or "",
+                )
             reply_text = await ingest_uploaded_image(
                 data,
                 claimed["filename"],
                 claimed["media_type"],
                 claimed.get("image_path") or claimed.get("protected_url"),
                 claimed.get("subject"),
+                **ingest_kwargs,
             )
         except Exception as exc:
             if is_transient_ingest_error(exc):
                 print(f"Warning: transient ingest error for {job_id}: {exc}")
-                claimed["status"] = "pending"
-                claimed["lease_until"] = None
-                try:
-                    write_job_record(claimed)
-                except EnqueueError as write_exc:
-                    print(f"Warning: failed to release lease for {job_id}: {write_exc}")
-                return claimed
+                return _release_job_for_retry(claimed)
             print(f"Error: ingest job {job_id} failed: {exc}")
             return _mark_job_failed(claimed, "ingest_failed")
         fields = _receipt_response_fields(reply_text)
@@ -1055,17 +1141,36 @@ async def _run_ingest_drain_worker() -> None:
 
 
 def _upload_ingest_prompt(
-    filename: str, protected_url: str, subject: str | None
+    filename: str,
+    protected_url: str,
+    subject: str | None,
+    capture: dict | None = None,
 ) -> str:
-    return (
+    subject_context = subject or ("Page capture" if capture else "Mobile upload")
+    prompt = (
         f"I uploaded a photo/screenshot named '{filename}'. "
         f"Protected Media Relative Path: {protected_url or 'N/A'}. "
-        f"Subject context: {subject or 'Mobile upload'}. "
+        f"Subject context: {subject_context}. "
         "Extract key text, details, and context from this image and store it into my Flair visual memory. "
         f"Pass image_url='{protected_url}' when storing the memory. "
         "If this image is a receipt or invoice, extract merchant, amount, currency, and date, "
         "pass them in store_memory custom_metadata together with image_url, keep the prose description, "
         'and include one reply line of the form RECEIPT: {"merchant":"...","amount":"...","currency":"...","date":"..."}'
+    )
+    if not capture:
+        return prompt
+    metadata = capture_mod.capture_store_metadata(
+        capture.get("source_url") or "",
+        capture.get("captured_at") or "",
+        capture.get("image_url") or protected_url or "",
+    )
+    return (
+        prompt
+        + " This image is a screenshot of a public web page. "
+        + "You MUST call store_memory and pass custom_metadata that includes "
+        + json.dumps(metadata)
+        + ". Copy source_url, captured_at, and capture_kind exactly, and mention "
+        + "the source URL in the description so the page can be recalled later."
     )
 
 
@@ -1075,9 +1180,10 @@ async def ingest_uploaded_image(
     media_type: str,
     protected_url: str,
     subject: str | None,
+    capture: dict | None = None,
 ) -> str:
     """Send the image through A2A for extract + store_memory. Returns reply text."""
-    prompt = _upload_ingest_prompt(filename, protected_url, subject)
+    prompt = _upload_ingest_prompt(filename, protected_url, subject, capture)
 
     async with httpx.AsyncClient(headers=_auth_headers(), timeout=120) as client:
         card = await _get_card(client)
@@ -1155,6 +1261,67 @@ async def upload_image(
         print(f"Error: upload persist/enqueue failed: {exc}")
         raise HTTPException(status_code=500, detail="Failed to persist upload") from exc
 
+    return JSONResponse(
+        {
+            "status": "accepted",
+            "job_id": job["job_id"],
+            "image_path": protected_url,
+        },
+        status_code=202,
+    )
+
+
+def _parse_capture_url_body(body: object) -> tuple[str, str | None]:
+    if not isinstance(body, dict):
+        raise HTTPException(
+            status_code=400, detail="Request body must be a JSON object"
+        )
+    url = body.get("url")
+    if not isinstance(url, str) or not url.strip():
+        raise HTTPException(status_code=400, detail="url is required")
+    if len(url) > _CAPTURE_URL_MAX_CHARS:
+        raise HTTPException(status_code=400, detail="url is too long")
+    subject = body.get("subject")
+    if subject is None:
+        cleaned_subject = None
+    elif not isinstance(subject, str):
+        raise HTTPException(status_code=400, detail="subject must be a string")
+    else:
+        cleaned_subject = subject.strip()[:500] or None
+    return url.strip(), cleaned_subject
+
+
+@app.post("/capture/url")
+async def capture_url(
+    req: Request,
+    x_api_key: Annotated[str | None, Header()] = None,
+):
+    """Reserve a screenshot path and enqueue capture. Rendering is not in this request."""
+    verify_api_key(req, x_api_key)
+    try:
+        body = await req.json()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400, detail="Request body must be JSON"
+        ) from exc
+    url, subject = _parse_capture_url_body(body)
+    image_name = f"{uuid.uuid4()}_page.jpg"
+    protected_url = f"/media/{image_name}"
+    try:
+        job = enqueue_ingest_job(
+            image_name,
+            "page.jpg",
+            "image/jpeg",
+            protected_url,
+            subject,
+            source_url=url,
+            capture_kind="url",
+        )
+    except EnqueueError as exc:
+        print(f"Error: capture enqueue failed: {exc}")
+        raise HTTPException(
+            status_code=500, detail="Failed to persist capture"
+        ) from exc
     return JSONResponse(
         {
             "status": "accepted",

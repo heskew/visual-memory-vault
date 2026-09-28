@@ -8,4 +8,5 @@ google-cloud-tasks>=2.16.0,<3.0.0
 python-multipart
 Pillow>=10.0.0
 pillow-heif>=0.18.0
+playwright>=1.49.1,<2.0.0
 

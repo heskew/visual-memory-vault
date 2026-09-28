@@ -123,6 +123,8 @@ def store_memory(
         tags: Optional short category labels, e.g. ["receipt", "travel"].
         custom_metadata: Optional structured attributes stored verbatim, e.g.
             {"merchant": "...", "amount": "...", "image_url": "/media/x.jpg"}.
+            For a page screenshot, include source_url, captured_at, and
+            capture_kind="url" alongside image_url.
 
     Returns:
         {"status": "stored", "subject": <subject>} on success, or
@@ -170,7 +172,10 @@ root_agent = Agent(
         "'date': 'YYYY-MM-DD', 'image_url': '<path>'}`. Keep the prose description.\n"
         "5. In your response to the user, summarize what was saved and highlight key details. "
         "For receipts, also include one machine-readable line:\n"
-        'RECEIPT: {"merchant":"...","amount":"...","currency":"...","date":"..."}\n\n'
+        'RECEIPT: {"merchant":"...","amount":"...","currency":"...","date":"..."}\n'
+        "6. When the user message includes source_url, captured_at, and capture_kind, "
+        "copy those values into custom_metadata verbatim together with image_url. "
+        "Mention the source URL in the description so the page can be recalled later.\n\n"
         "When users ask to recall, find, or browse memories, use `search_memory` or `list_memories`."
     ),
     tools=flair_tools,

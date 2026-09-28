@@ -26,6 +26,7 @@ from a2a.client import A2AClientError, AgentCardResolutionError
 from httpx import ASGITransport, AsyncClient
 from PIL import Image
 
+from frontend.capture import CaptureRejected
 from frontend.main import EnqueueError, PersistError, drain_pending_ingest_jobs
 
 
@@ -483,3 +484,127 @@ async def test_web_client_uploads_then_polls_jobs_no_wait_flag(proxy_env, monkey
     finally:
         server.should_exit = True
         thread.join(timeout=3)
+
+
+@pytest.fixture
+def capture_renderer(monkeypatch):
+    calls = {"n": 0}
+
+    def render(url: str) -> bytes:
+        calls["n"] += 1
+        calls["url"] = url
+        return _jpeg_bytes()
+
+    monkeypatch.setattr("frontend.capture.render_page_screenshot", render)
+    monkeypatch.setattr(
+        "frontend.capture.resolve_host", lambda _host: ["93.184.216.34"]
+    )
+    monkeypatch.setattr("frontend.main.CLOUD_TASKS_QUEUE", None)
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_capture_url_202_then_poll_succeeded(
+    client, proxy_env, capture_renderer, monkeypatch
+):
+    """POST /capture/url matches the upload 202 contract; the worker renders later."""
+    seen = {}
+
+    async def fake_ingest(*args, capture=None):
+        seen["capture"] = capture
+        seen["bytes"] = args[0]
+        return "Stored https://example.com/docs"
+
+    monkeypatch.setattr("frontend.main.ingest_uploaded_image", fake_ingest)
+
+    started = time.monotonic()
+    accepted = await client.post(
+        "/capture/url?wait=1",
+        json={"url": "https://example.com/docs", "subject": "Docs"},
+    )
+    assert time.monotonic() - started < 2
+    assert accepted.status_code == 202
+    body = accepted.json()
+    assert set(body) == {"status", "job_id", "image_path"}
+    assert body["status"] == "accepted"
+    assert body["image_path"].endswith("_page.jpg")
+    assert capture_renderer["n"] == 0
+
+    job_id = body["job_id"]
+    disk = json.loads((proxy_env / "jobs" / f"{job_id}.json").read_text())
+    assert disk["source_url"] == "https://example.com/docs"
+    assert disk["capture_kind"] == "url"
+    assert disk["subject"] == "Docs"
+    assert disk["status"] == "pending"
+
+    pending = await client.get(f"/jobs/{job_id}")
+    assert pending.status_code == 200
+    assert pending.json()["status"] == "pending"
+    assert "error" not in pending.json()
+
+    consumer = await client.post("/ingest", json={"job_id": job_id})
+    assert consumer.status_code == 200
+    assert consumer.json()["completed"] == [job_id]
+    assert capture_renderer["n"] == 1
+    assert capture_renderer["url"] == "https://example.com/docs"
+    done = await client.get(f"/jobs/{job_id}")
+    assert done.json()["status"] == "succeeded"
+    assert done.json()["summary"] == "Stored https://example.com/docs"
+    assert seen["capture"]["capture_kind"] == "url"
+    assert seen["capture"]["source_url"] == "https://example.com/docs"
+    assert seen["bytes"].startswith(b"\xff\xd8")
+    image_name = body["image_path"].rsplit("/", 1)[-1]
+    assert (proxy_env / image_name).is_file()
+
+    uploaded = await _upload(client)
+    assert uploaded.status_code == 202
+    assert set(uploaded.json()) == {"status", "job_id", "image_path"}
+
+
+@pytest.mark.asyncio
+async def test_capture_url_terminal_scheme_and_metadata_fail(client, capture_renderer):
+    renders_before = capture_renderer["n"]
+    for url, reason in (
+        ("ftp://example.com/a", "unsupported_scheme"),
+        ("http://169.254.169.254/computeMetadata/v1/", "blocked_url"),
+        ("file:///etc/passwd", "unsupported_scheme"),
+    ):
+        accepted = await client.post("/capture/url", json={"url": url})
+        assert accepted.status_code == 202
+        job_id = accepted.json()["job_id"]
+        assert (await client.get(f"/jobs/{job_id}")).json()["status"] == "pending"
+        consumer = await client.post("/ingest", json={"job_id": job_id})
+        assert consumer.status_code == 200
+        failed = await client.get(f"/jobs/{job_id}")
+        assert failed.json()["status"] == "failed"
+        assert failed.json()["error"] == reason
+        retry = await client.post("/ingest", json={"job_id": job_id})
+        assert retry.status_code == 200
+        assert (await client.get(f"/jobs/{job_id}")).json()["status"] == "failed"
+    assert capture_renderer["n"] == renders_before
+
+
+@pytest.mark.asyncio
+async def test_capture_render_timeout_fails_without_extract(client, monkeypatch):
+    def render(_url: str) -> bytes:
+        raise CaptureRejected("render_timeout")
+
+    monkeypatch.setattr("frontend.capture.render_page_screenshot", render)
+    monkeypatch.setattr(
+        "frontend.capture.resolve_host", lambda _host: ["93.184.216.34"]
+    )
+
+    async def ingest_must_not_run(*_args, **_kwargs):
+        raise AssertionError("extract must not run after render_timeout")
+
+    monkeypatch.setattr("frontend.main.ingest_uploaded_image", ingest_must_not_run)
+    accepted = await client.post(
+        "/capture/url", json={"url": "https://example.com/slow"}
+    )
+    assert accepted.status_code == 202
+    job_id = accepted.json()["job_id"]
+    consumer = await client.post("/ingest", json={"job_id": job_id})
+    assert consumer.status_code == 200
+    failed = await client.get(f"/jobs/{job_id}")
+    assert failed.json()["status"] == "failed"
+    assert failed.json()["error"] == "render_timeout"

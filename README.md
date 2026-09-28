@@ -40,6 +40,7 @@ Flair brings sovereign, persistent, and federated memory to the agent ecosystem:
 flowchart TD
     subgraph Capture["Ingestion Surfaces"]
         Web["Web UI (Chat + Photo Upload)"]
+        URL["POST /capture/url"]
         iOS["Mobile & iOS Shortcuts"]
         Persist["Image + durable job (GCS / local)"]
         Tasks["Cloud Tasks → POST /ingest"]
@@ -59,6 +60,7 @@ flowchart TD
     end
 
     Web -->|POST /upload 202 then GET /jobs| Persist
+    URL -->|202 then worker screenshot| Persist
     Web -->|Chat| Agent
     iOS -->|POST /upload 202| Persist
     Persist --> Tasks
@@ -78,7 +80,7 @@ flowchart TD
 
 - **Automatic Visual Extraction**: Drop in a receipt, whiteboard photo, or WiFi card—Gemini extracts all text, numerical amounts, dates, and context with zero manual tagging.
 - **Durable Semantic Recall**: Ask questions naturally in plain English (*"How much was that dinner in Austin?"*, *"What was the hotel door code?"*).
-- **Dual Serving Surface**: Exposes native ADK SSE streams (`/run_sse`), A2A streaming endpoints (`/a2a/app/`), and a clean frontend proxy (`/chat`, `/upload`, `/media`).
+- **Dual Serving Surface**: Exposes native ADK SSE streams (`/run_sse`), A2A streaming endpoints (`/a2a/app/`), and a clean frontend proxy (`/chat`, `/upload`, `/capture/url`, `/media`).
 - **Cryptographic Security**: Every record is signed with an Ed25519 private key seed, preventing unauthorized memory tampering.
 
 ---
@@ -156,6 +158,30 @@ Response (`202 Accepted`):
 ```
 
 The in-app web UI uses the same `POST /upload`, then polls `GET /jobs/{job_id}` until extract + `store_memory` finishes and the receipt chip can render. Production ingest is a **new HTTP request** created by Cloud Tasks (`POST /ingest`), not CPU leftover on the upload instance. Local uvicorn can drain jobs when `INGEST_DRAIN_INTERVAL_SEC` is set.
+
+### Capture a public page
+
+`POST /capture/url` takes a public `http` or `https` URL, reserves an image path, and returns the same `202` as an upload. The worker screenshots the page (viewport JPEG), saves it like an uploaded photo, then runs the existing extract and `store_memory` path. Poll `GET /jobs/{job_id}`. There is no `?wait=1`.
+
+```bash
+curl -X POST http://localhost:8080/capture/url \
+  -H "Content-Type: application/json" \
+  -d '{"url":"https://example.com","subject":"Example"}'
+```
+
+Response (`202 Accepted`):
+
+```json
+{
+  "status": "accepted",
+  "job_id": "<uuid>",
+  "image_path": "/media/<uuid>_page.jpg"
+}
+```
+
+The stored memory's `custom_metadata` includes `source_url`, `captured_at`, and `capture_kind` `url`, and the description mentions the page so recall can find it.
+
+Only public HTTP(S) URLs are captured. Other schemes, unresolvable hosts, and addresses that are loopback, private, link-local, or cloud metadata finish as `failed` with `unsupported_scheme`, `bad_url`, or `blocked_url` when that target is the top-level page. A blocked iframe or other subresource is dropped and the screenshot of the page still completes. Each request is connected only to an address checked at connect time, so a hostname that later points at a private or link-local address is not fetched. A render that exceeds `CAPTURE_RENDER_TIMEOUT_SEC` (default 20s) finishes as `failed` with `render_timeout`. A transient render or DNS blip stays `pending` and is retried like any other ingest. The proxy image installs headless Chromium; give that Cloud Run service at least 1GiB of memory. Gated pages that need a signed-in browser are out of scope.
 
 ---
 
