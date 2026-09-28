@@ -41,6 +41,7 @@ flowchart TD
     subgraph Capture["Ingestion Surfaces"]
         Web["Web UI (Chat + Photo Upload)"]
         URL["POST /capture/url"]
+        Stitch["POST /capture/stitch"]
         iOS["Mobile & iOS Shortcuts"]
         Persist["Image + durable job (GCS / local)"]
         Tasks["Cloud Tasks → POST /ingest"]
@@ -61,6 +62,7 @@ flowchart TD
 
     Web -->|POST /upload 202 then GET /jobs| Persist
     URL -->|202 then worker screenshot| Persist
+    Stitch -->|202 then worker stacks JPEG| Persist
     Web -->|Chat| Agent
     iOS -->|POST /upload 202| Persist
     Persist --> Tasks
@@ -80,7 +82,7 @@ flowchart TD
 
 - **Automatic Visual Extraction**: Drop in a receipt, whiteboard photo, or WiFi card—Gemini extracts all text, numerical amounts, dates, and context with zero manual tagging.
 - **Durable Semantic Recall**: Ask questions naturally in plain English (*"How much was that dinner in Austin?"*, *"What was the hotel door code?"*).
-- **Dual Serving Surface**: Exposes native ADK SSE streams (`/run_sse`), A2A streaming endpoints (`/a2a/app/`), and a clean frontend proxy (`/chat`, `/upload`, `/capture/url`, `/media`).
+- **Dual Serving Surface**: Exposes native ADK SSE streams (`/run_sse`), A2A streaming endpoints (`/a2a/app/`), and a clean frontend proxy (`/chat`, `/upload`, `/capture/url`, `/capture/stitch`, `/media`).
 - **Cryptographic Security**: Every record is signed with an Ed25519 private key seed, preventing unauthorized memory tampering.
 
 ---
@@ -182,6 +184,31 @@ Response (`202 Accepted`):
 The stored memory's `custom_metadata` includes `source_url` (the requested URL), `captured_at`, and `capture_kind` `url`. When the page has them, it also includes `page_title` (the document title at capture time), `final_url` (the URL after redirects; it may differ from `source_url`), and `outbound_links`: up to 50 `{href, text}` pairs. Those are the first distinct http(s) anchors in document order, not viewport visibility, excluding links back to the same document. Link text is whitespace-collapsed and at most 160 characters. If the list would push the metadata past 48KB, links drop from the end so Flair still accepts the record. Link targets are not fetched, and page HTML is not stored. A missing title or an empty link list does not fail the job; the screenshot and the original fields are still stored. The description mentions the page so recall can find it.
 
 Only public HTTP(S) URLs are captured. Other schemes, unresolvable hosts, and addresses that are loopback, private, link-local, or cloud metadata finish as `failed` with `unsupported_scheme`, `bad_url`, or `blocked_url` when that target is the top-level page. A blocked iframe or other subresource is dropped and the screenshot of the page still completes. Each request is connected only to an address checked at connect time, so a hostname that later points at a private or link-local address is not fetched. A render that exceeds `CAPTURE_RENDER_TIMEOUT_SEC` (default 20s) finishes as `failed` with `render_timeout`. A transient render or DNS blip stays `pending` and is retried like any other ingest. The proxy image installs headless Chromium; give that Cloud Run service at least 1GiB of memory. Gated pages that need a signed-in browser are out of scope.
+
+### Stitch screenshots into one memory
+
+`POST /capture/stitch` accepts two or more screenshots and returns the same `202` as an upload (`status`, `job_id`, `image_path`). The worker stacks those images, top to bottom in the order they were sent, into one JPEG, saves it like an uploaded photo, then runs extract and `store_memory`. Poll `GET /jobs/{job_id}`. There is no `?wait=1`. Remote image URLs are not fetched.
+
+```bash
+curl -X POST http://localhost:8080/capture/stitch \
+  -F "file=@one.jpg" \
+  -F "file=@two.png" \
+  -F "subject=Trip"
+```
+
+Response (`202 Accepted`):
+
+```json
+{
+  "status": "accepted",
+  "job_id": "<uuid>",
+  "image_path": "/media/<uuid>_stitch.jpg"
+}
+```
+
+The stored memory's `custom_metadata` includes `capture_kind` `stitch`, `source_image_ids`, and `captured_at`. `source_image_ids` is the list of ids assigned when the request is accepted, one UUID per file part, in that same order. Those ids stay on the job if the worker retries; they are not hashes of the pixels, so two identical screenshots keep two ids. Optional `subject` is the same short label as upload and URL capture (at most 500 characters).
+
+Send JPEG, PNG, WebP, or HEIC. At most 8 images. Each image may be at most 8 MiB and 16000000 pixels, with neither side longer than 16384 px. The stacked JPEG may be at most 48000000 pixels, 16384 px wide, 65535 px tall, and 12 MiB. The worker decodes one source at a time onto one RGB canvas so the compose stays within Cloud Run memory. Too few images, too many, an unsupported type, or an oversized file is rejected on the request. A stack that cannot be composed, or a source that cannot be decoded, finishes as `failed`. A transient save or extract blip stays `pending` and is retried like any other ingest. Narrower images are centered on white. Images are stacked as stored.
 
 ---
 

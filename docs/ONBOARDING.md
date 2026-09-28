@@ -106,6 +106,8 @@ agents-cli deploy \
 
    To capture a public web page instead of a photo, `POST /capture/url` on that same proxy with JSON `{"url":"https://example.com","subject":"Example"}`. The response is the same `202` (`status`, `job_id`, `image_path`). The URL, subject, and `capture_kind=url` are stored on the durable job; the worker screenshots the page before extract and `store_memory`. The memory metadata includes `source_url`, `captured_at`, and `capture_kind=url`. When the page has them, it also includes `page_title`, `final_url` (after redirects), and `outbound_links` (at most 50 `{href, text}` pairs; targets are not fetched and page HTML is not stored). A missing title or an empty link list still succeeds. Poll `GET /jobs/{job_id}` the same way. A bad URL, an unsupported scheme, a blocked address, or a render timeout finishes as `failed`.
 
+   To compose several screenshots into one memory, `POST /capture/stitch` on that same proxy as multipart form data: repeat `file` for each JPEG, PNG, WebP, or HEIC (2 to 8 images) and optional `subject`. The response is the same `202` (`status`, `job_id`, `image_path`). The worker stacks the images top to bottom into one JPEG before extract and `store_memory`. The memory metadata includes `capture_kind=stitch`, `source_image_ids` (one id per input, assigned when the request is accepted, in upload order), and `captured_at`. Remote image URLs are not fetched. Poll `GET /jobs/{job_id}` the same way. Too few, too many, unsupported, or oversized inputs are rejected; a compose that cannot be stored finishes as `failed`.
+
    2. Verify the memory appears in your `casa.heskew` Flair instance:
    ```bash
    flair memory list --target https://casa.heskew.harperfabric.com

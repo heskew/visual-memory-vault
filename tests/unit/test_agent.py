@@ -34,6 +34,17 @@ def test_agent_instruction_copies_url_capture_metadata():
     assert "page HTML" in (store_memory.__doc__ or "")
 
 
+def test_agent_instruction_copies_stitch_metadata():
+    instruction = root_agent.instruction
+    assert 'capture_kind "stitch"' in instruction
+    assert "source_image_ids" in instruction
+    assert "captured_at" in instruction
+    assert "composed stack of screenshots" in instruction
+    doc = store_memory.__doc__ or ""
+    assert "source_image_ids" in doc
+    assert 'capture_kind="stitch"' in doc
+
+
 def test_app_structure():
     assert app.name == "app"
     assert app.root_agent is root_agent
