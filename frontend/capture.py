@@ -7,17 +7,23 @@ socket pinned to an address checked at connect time. Chromium does not
 resolve those names itself. A blocked iframe is dropped; only a blocked
 top-level page fails the capture. Callers persist the JPEG on the existing
 upload path.
+
+After navigation, the same page object supplies Flair metadata: document
+title (``page.title()``), the post-redirect URL (``page.url``), and a capped
+list of outbound ``{href, text}`` links. Link targets are not requested.
 """
 
 from __future__ import annotations
 
 import http.client
 import ipaddress
+import json
 import os
 import re
 import socket
 import threading
 import zlib
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from urllib.parse import urlparse
 
@@ -28,6 +34,19 @@ CAPTURE_VIEWPORT_WIDTH = 1280
 CAPTURE_VIEWPORT_HEIGHT = 720
 CAPTURE_JPEG_QUALITY = 80
 CAPTURE_MAX_SUBRESOURCE_BYTES = 8 * 1024 * 1024
+# First N distinct http(s) anchors in document order. Same-document links
+# (including fragments) are skipped so the cap is spent on other targets.
+# This is document order, not viewport visibility: links below the fold count.
+# Targets are not fetched. Over-long hrefs are dropped, not truncated.
+CAPTURE_MAX_OUTBOUND_LINKS = 50
+CAPTURE_MAX_LINK_TEXT_CHARS = 160
+CAPTURE_MAX_PAGE_TITLE_CHARS = 300
+# Flair rejects custom_metadata above 64KB. Stay under that with room for
+# receipt fields the model may add next to these capture fields. Extra links
+# are dropped from the end; the screenshot and core fields still store.
+CAPTURE_METADATA_BUDGET_BYTES = 48 * 1024
+# Defense in depth if a page returns more raw rows than the in-page cap.
+_MAX_RAW_LINKS_SCANNED = CAPTURE_MAX_OUTBOUND_LINKS * 20
 # Chromium must not open its own sockets. QUIC bypasses an HTTP route
 # handler; DNS prefetch would resolve names the worker never checked.
 # ``--disable-features=WebRTC`` is not a Chromium feature name, so it leaves
@@ -64,6 +83,53 @@ WEBRTC_DISABLE_SCRIPT = """
     } catch (e) {}
   }
 })();
+"""
+# In-page read of anchors already matched by Playwright's ``a[href]`` locator.
+# Uses the DOM ``href`` property (absolute URL) and short text. No innerHTML,
+# and no request to any link target. ``limits`` is
+# ``{max, maxHref, maxText}``.
+OUTBOUND_LINKS_SCRIPT = """
+(anchors, limits) => {
+  const max = Number(limits && limits.max) || 0;
+  const maxHref = Number(limits && limits.maxHref) || 0;
+  const maxText = Number(limits && limits.maxText) || 0;
+  const seen = new Set();
+  const out = [];
+  const bare = (value) => {
+    try {
+      const parsed = new URL(String(value), location.href);
+      parsed.hash = "";
+      return parsed.href;
+    } catch (e) {
+      return "";
+    }
+  };
+  const here = bare(location.href);
+  for (const a of anchors) {
+    if (out.length >= max) break;
+    let href = "";
+    try {
+      href = String(a.href || "");
+    } catch (e) {
+      continue;
+    }
+    if (!href || (maxHref && href.length > maxHref) || seen.has(href)) continue;
+    const protocol = String(a.protocol || "").toLowerCase();
+    if (protocol !== "http:" && protocol !== "https:") continue;
+    if (here && bare(href) === here) continue;
+    seen.add(href);
+    let text = "";
+    try {
+      text = a.innerText || a.textContent || a.getAttribute("aria-label") || "";
+    } catch (e) {
+      text = "";
+    }
+    text = String(text).replace(/\\s+/g, " ").trim();
+    if (maxText && text.length > maxText) text = text.slice(0, maxText).trim();
+    out.push({ href: href, text: text });
+  }
+  return out;
+}
 """
 _HOP_BY_HOP = frozenset(
     {
@@ -123,16 +189,262 @@ def utc_now() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def capture_store_metadata(
-    source_url: str, captured_at: str, image_url: str
-) -> dict[str, str]:
-    """Structured fields the Flair store must keep for a URL capture."""
+@dataclass(frozen=True)
+class CapturedPage:
+    """Viewport JPEG plus the page facts collected at the same moment."""
+
+    image: bytes
+    page_title: str = ""
+    final_url: str = ""
+    outbound_links: tuple[dict[str, str], ...] = ()
+
+
+_TAG_RE = re.compile(r"<[^>]*>")
+_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]+")
+
+
+def _clean_short_text(value: object, limit: int) -> str:
+    """Whitespace-collapsed plain text. Tags and control characters are removed."""
+    if not isinstance(value, str) or limit <= 0:
+        return ""
+    text = _TAG_RE.sub(" ", value)
+    text = _CONTROL_RE.sub(" ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > limit:
+        text = text[:limit].rstrip()
+    return text
+
+
+def _strip_userinfo(url: str) -> str:
+    parsed = urlparse(url)
+    if parsed.username is None and parsed.password is None:
+        return url
+    host = parsed.hostname
+    if not host:
+        return ""
+    if ":" in host:
+        host = f"[{host}]"
+    netloc = f"{host}:{parsed.port}" if parsed.port else host
+    return parsed._replace(netloc=netloc).geturl()
+
+
+def _http_url_or_blank(value: object) -> str:
+    """Absolute http(s) URL with no userinfo, or ``""``.
+
+    Over-long values are dropped. Nothing is fetched.
+    """
+    if not isinstance(value, str):
+        return ""
+    raw = value.strip()
+    if not raw or any(char in raw for char in "\r\n\t "):
+        return ""
+    parsed = urlparse(raw)
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in _ALLOWED_SCHEMES or not parsed.hostname:
+        return ""
+    cleaned = _strip_userinfo(raw)
+    if not cleaned:
+        return ""
+    rebuilt = urlparse(cleaned)._replace(scheme=scheme).geturl()
+    if len(rebuilt) > CAPTURE_MAX_URL_LENGTH or any(
+        char in rebuilt for char in "\r\n\t "
+    ):
+        return ""
+    return rebuilt
+
+
+def _without_fragment(url: str) -> str:
+    return urlparse(url)._replace(fragment="").geturl()
+
+
+def normalize_outbound_links(
+    raw: object, *, page_url: str = ""
+) -> list[dict[str, str]]:
+    """Capped ``{href, text}`` list. Same-document links and non-http(s) are dropped.
+
+    First occurrence of an href wins (document order). Link targets are not
+    fetched. Extra keys on each row, including any HTML blob, are discarded.
+    """
+    if not isinstance(raw, list):
+        return []
+    here = _without_fragment(_http_url_or_blank(page_url))
+    seen: set[str] = set()
+    links: list[dict[str, str]] = []
+    for item in raw[:_MAX_RAW_LINKS_SCANNED]:
+        if len(links) >= CAPTURE_MAX_OUTBOUND_LINKS:
+            break
+        if not isinstance(item, dict):
+            continue
+        href = _http_url_or_blank(item.get("href"))
+        if not href or href in seen:
+            continue
+        if here and _without_fragment(href) == here:
+            continue
+        seen.add(href)
+        links.append(
+            {
+                "href": href,
+                "text": _clean_short_text(
+                    item.get("text"), CAPTURE_MAX_LINK_TEXT_CHARS
+                ),
+            }
+        )
+    return links
+
+
+def _fit_capture_metadata(metadata: dict[str, object]) -> dict[str, object]:
+    """Shorten enrich fields until the JSON fits ``CAPTURE_METADATA_BUDGET_BYTES``.
+
+    Core fields (``image_url``, ``source_url``, ``captured_at``,
+    ``capture_kind``) stay. Links drop from the end of document order. A
+    missing title or an empty link list is not an error.
+    """
+    fitted = dict(metadata)
+    links = fitted.get("outbound_links")
+    if isinstance(links, list):
+        fitted["outbound_links"] = list(links)
+    while len(json.dumps(fitted).encode("utf-8")) > CAPTURE_METADATA_BUDGET_BYTES:
+        current = fitted.get("outbound_links")
+        if isinstance(current, list) and current:
+            current.pop()
+            if not current:
+                del fitted["outbound_links"]
+            continue
+        if "page_title" in fitted:
+            del fitted["page_title"]
+            continue
+        if "final_url" in fitted:
+            del fitted["final_url"]
+            continue
+        break
+    return fitted
+
+
+def collect_page_facts(page) -> dict[str, object]:
+    """Title, final URL, and capped links from a Playwright page.
+
+    ``page.title()`` and ``page.url`` are the Playwright page APIs. Links come
+    from ``locator("a[href]").evaluate_all`` (the DOM ``href`` property and
+    short text), then ``normalize_outbound_links``. Any failure leaves that
+    field empty; the screenshot still proceeds. Link targets are not fetched.
+    """
+    title = ""
+    final_url = ""
+    raw: list = []
+    try:
+        got = page.title()
+        if isinstance(got, str):
+            title = got
+    except Exception:
+        title = ""
+    try:
+        got_url = page.url
+        if isinstance(got_url, str):
+            final_url = got_url
+    except Exception:
+        final_url = ""
+    try:
+        evaluated = page.locator("a[href]").evaluate_all(
+            OUTBOUND_LINKS_SCRIPT,
+            {
+                "max": CAPTURE_MAX_OUTBOUND_LINKS,
+                "maxHref": CAPTURE_MAX_URL_LENGTH,
+                "maxText": CAPTURE_MAX_LINK_TEXT_CHARS,
+            },
+        )
+        if isinstance(evaluated, list):
+            raw = evaluated
+    except Exception:
+        raw = []
+    cleaned_final = _http_url_or_blank(final_url)
     return {
+        "page_title": _clean_short_text(title, CAPTURE_MAX_PAGE_TITLE_CHARS),
+        "final_url": cleaned_final,
+        "outbound_links": normalize_outbound_links(raw, page_url=cleaned_final),
+    }
+
+
+def _empty_page_facts() -> dict[str, object]:
+    return {"page_title": "", "final_url": "", "outbound_links": []}
+
+
+def capture_store_metadata(
+    source_url: str,
+    captured_at: str,
+    image_url: str,
+    *,
+    page_title: str | None = None,
+    final_url: str | None = None,
+    outbound_links: list | None = None,
+) -> dict[str, object]:
+    """Structured fields the Flair store must keep for a URL capture.
+
+    ``source_url``, ``captured_at``, and ``capture_kind`` are always present.
+    ``page_title``, ``final_url``, and ``outbound_links`` are added only when
+    they survive cleaning. A missing title or an empty link list is omitted,
+    not an error. ``outbound_links`` is at most ``CAPTURE_MAX_OUTBOUND_LINKS``
+    ``{"href", "text"}`` objects, and the whole dict is shortened until its
+    JSON fits ``CAPTURE_METADATA_BUDGET_BYTES``. Link targets are not fetched.
+    """
+    metadata: dict[str, object] = {
         "image_url": image_url,
         "source_url": source_url,
         "captured_at": captured_at,
         "capture_kind": "url",
     }
+    title = _clean_short_text(page_title, CAPTURE_MAX_PAGE_TITLE_CHARS)
+    if title:
+        metadata["page_title"] = title
+    cleaned_final = _http_url_or_blank(final_url)
+    if cleaned_final:
+        metadata["final_url"] = cleaned_final
+    if outbound_links is not None:
+        links = normalize_outbound_links(outbound_links, page_url=cleaned_final)
+        if links:
+            metadata["outbound_links"] = links
+    return _fit_capture_metadata(metadata)
+
+
+def remember_page_facts(record: dict, captured: CapturedPage) -> None:
+    """Copy fitted title, final URL, and links onto a durable job record.
+
+    Empty fields are left unset. The list matches what ``store_memory`` is
+    asked to copy, including the metadata size budget.
+    """
+    for key in ("page_title", "final_url", "outbound_links"):
+        record.pop(key, None)
+    if captured.page_title:
+        record["page_title"] = captured.page_title
+    if captured.final_url:
+        record["final_url"] = captured.final_url
+    if captured.outbound_links:
+        record["outbound_links"] = [dict(link) for link in captured.outbound_links]
+    fitted = capture_metadata_from_record(record)
+    for key in ("page_title", "final_url", "outbound_links"):
+        record.pop(key, None)
+        if key in fitted:
+            record[key] = fitted[key]
+
+
+def capture_metadata_from_record(
+    record: dict, *, image_url: str = ""
+) -> dict[str, object]:
+    """Build Flair metadata from a job record or a previous metadata dict.
+
+    Reads ``image_url`` or ``image_path``. Non-string enrich fields are
+    ignored so a corrupt job still stores the screenshot fields.
+    """
+    title = record.get("page_title")
+    final = record.get("final_url")
+    links = record.get("outbound_links")
+    return capture_store_metadata(
+        record.get("source_url") or "",
+        record.get("captured_at") or "",
+        record.get("image_url") or record.get("image_path") or image_url or "",
+        page_title=title if isinstance(title, str) else "",
+        final_url=final if isinstance(final, str) else "",
+        outbound_links=links if isinstance(links, list) else None,
+    )
 
 
 def _ip_is_blocked(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
@@ -626,19 +938,55 @@ def handle_capture_route(route, blocked: dict, *, resolver=None, fetch=None) -> 
         route.abort()
 
 
+def _as_captured_page(rendered: object) -> CapturedPage:
+    if isinstance(rendered, CapturedPage):
+        return rendered
+    if isinstance(rendered, bytes | bytearray):
+        return CapturedPage(image=bytes(rendered))
+    raise CaptureTransient("render_failed")
+
+
+def capture_public_page(url: str) -> CapturedPage:
+    """Validate ``url`` and return a viewport JPEG plus page facts.
+
+    Safe to run off the event loop. A missing title or an empty link list
+    does not fail the capture. Link targets are not fetched. A renderer that
+    returns JPEG bytes only (no facts) still succeeds.
+    """
+    normalized = validate_capture_url(url)
+    page = _as_captured_page(render_page_screenshot(normalized))
+    if not page.image:
+        raise CaptureTransient("render_failed")
+    if len(page.image) > CAPTURE_MAX_IMAGE_BYTES:
+        raise CaptureRejected("render_too_large")
+    title = _clean_short_text(page.page_title, CAPTURE_MAX_PAGE_TITLE_CHARS)
+    final = _http_url_or_blank(page.final_url)
+    links = normalize_outbound_links(list(page.outbound_links), page_url=final)
+    if (
+        title == page.page_title
+        and final == page.final_url
+        and links == list(page.outbound_links)
+    ):
+        return page
+    return CapturedPage(
+        image=page.image,
+        page_title=title,
+        final_url=final,
+        outbound_links=tuple(links),
+    )
+
+
 def capture_screenshot_bytes(url: str) -> bytes:
     """Validate ``url`` and return a viewport JPEG. Safe to run off the event loop."""
-    normalized = validate_capture_url(url)
-    data = render_page_screenshot(normalized)
-    if not data:
-        raise CaptureTransient("render_failed")
-    if len(data) > CAPTURE_MAX_IMAGE_BYTES:
-        raise CaptureRejected("render_too_large")
-    return data
+    return capture_public_page(url).image
 
 
-def render_page_screenshot(url: str) -> bytes:
-    """Headless Chromium viewport JPEG. Timeouts are terminal; other blips retry."""
+def render_page_screenshot(url: str) -> CapturedPage:
+    """Headless Chromium viewport JPEG plus page facts.
+
+    Timeouts are terminal; other blips retry. Title and link collection
+    failures are empty fields, not a failed capture.
+    """
     validate_capture_url(url)
     try:
         from playwright.sync_api import TimeoutError as PlaywrightTimeout
@@ -687,7 +1035,11 @@ def render_page_screenshot(url: str) -> bytes:
             if blocked["document"]:
                 raise CaptureRejected("blocked_url")
             try:
-                return page.screenshot(
+                facts = collect_page_facts(page)
+            except Exception:
+                facts = _empty_page_facts()
+            try:
+                image = page.screenshot(
                     type="jpeg",
                     quality=CAPTURE_JPEG_QUALITY,
                     full_page=False,
@@ -700,6 +1052,19 @@ def render_page_screenshot(url: str) -> bytes:
                 raise
             except Exception as exc:
                 raise CaptureTransient("render_failed") from exc
+            if not isinstance(image, bytes | bytearray) or not image:
+                raise CaptureTransient("render_failed")
+            links = facts.get("outbound_links")
+            if not isinstance(links, list):
+                links = []
+            title = facts.get("page_title")
+            final = facts.get("final_url")
+            return CapturedPage(
+                image=bytes(image),
+                page_title=title if isinstance(title, str) else "",
+                final_url=final if isinstance(final, str) else "",
+                outbound_links=tuple(links),
+            )
     except (CaptureRejected, CaptureTransient):
         raise
     except Exception as exc:

@@ -26,7 +26,7 @@ from a2a.client import A2AClientError, AgentCardResolutionError
 from httpx import ASGITransport, AsyncClient
 from PIL import Image
 
-from frontend.capture import CaptureRejected
+from frontend.capture import CAPTURE_MAX_OUTBOUND_LINKS, CapturedPage, CaptureRejected
 from frontend.main import EnqueueError, PersistError, drain_pending_ingest_jobs
 
 
@@ -608,3 +608,61 @@ async def test_capture_render_timeout_fails_without_extract(client, monkeypatch)
     failed = await client.get(f"/jobs/{job_id}")
     assert failed.json()["status"] == "failed"
     assert failed.json()["error"] == "render_timeout"
+
+
+@pytest.mark.asyncio
+async def test_capture_url_metadata_includes_title_final_url_and_links(
+    client, proxy_env, monkeypatch
+):
+    """Enrich fields are on the ingest metadata. The 202 body stays unchanged."""
+
+    def render(url: str) -> CapturedPage:
+        assert url == "https://example.com/docs"
+        links = tuple(
+            {"href": f"https://example.com/p/{i}", "text": f"Link {i}"}
+            for i in range(CAPTURE_MAX_OUTBOUND_LINKS + 2)
+        )
+        return CapturedPage(
+            image=_jpeg_bytes(),
+            page_title="Example docs",
+            final_url="https://example.com/docs/final",
+            outbound_links=links,
+        )
+
+    monkeypatch.setattr("frontend.capture.render_page_screenshot", render)
+    monkeypatch.setattr(
+        "frontend.capture.resolve_host", lambda _host: ["93.184.216.34"]
+    )
+    monkeypatch.setattr("frontend.main.CLOUD_TASKS_QUEUE", None)
+    seen = {}
+
+    async def fake_ingest(*_args, capture=None):
+        seen["capture"] = capture
+        return "Stored https://example.com/docs"
+
+    monkeypatch.setattr("frontend.main.ingest_uploaded_image", fake_ingest)
+    accepted = await client.post(
+        "/capture/url",
+        json={"url": "https://example.com/docs", "subject": "Docs"},
+    )
+    assert accepted.status_code == 202
+    assert set(accepted.json()) == {"status", "job_id", "image_path"}
+    job_id = accepted.json()["job_id"]
+    consumer = await client.post("/ingest", json={"job_id": job_id})
+    assert consumer.status_code == 200
+    done = await client.get(f"/jobs/{job_id}")
+    assert done.json()["status"] == "succeeded"
+    assert "outbound_links" not in done.json()
+    stored = seen["capture"]
+    assert stored["page_title"] == "Example docs"
+    assert stored["final_url"] == "https://example.com/docs/final"
+    assert stored["source_url"] == "https://example.com/docs"
+    assert stored["capture_kind"] == "url"
+    assert len(stored["outbound_links"]) == CAPTURE_MAX_OUTBOUND_LINKS
+    assert stored["outbound_links"][0] == {
+        "href": "https://example.com/p/0",
+        "text": "Link 0",
+    }
+    record = json.loads((proxy_env / "jobs" / f"{job_id}.json").read_text())
+    assert record["page_title"] == "Example docs"
+    assert len(record["outbound_links"]) == CAPTURE_MAX_OUTBOUND_LINKS
