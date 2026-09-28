@@ -982,19 +982,23 @@ async def _ensure_url_screenshot(claimed: dict) -> dict:
         return claimed
     timeout = capture_mod.CAPTURE_RENDER_TIMEOUT_SEC + _CAPTURE_THREAD_SLACK_SEC
     try:
-        jpeg = await asyncio.wait_for(
-            asyncio.to_thread(capture_mod.capture_screenshot_bytes, source_url),
+        captured = await asyncio.wait_for(
+            asyncio.to_thread(capture_mod.capture_public_page, source_url),
             timeout=timeout,
         )
     except TimeoutError as exc:
         raise capture_mod.CaptureRejected("render_timeout") from exc
-    file_bytes, _filename, media_type = normalize_image(jpeg, "page.jpg", "image/jpeg")
+    file_bytes, _filename, media_type = normalize_image(
+        captured.image, "page.jpg", "image/jpeg"
+    )
     if len(file_bytes) > capture_mod.CAPTURE_MAX_IMAGE_BYTES:
         raise capture_mod.CaptureRejected("render_too_large")
     persist_uploaded_image(file_bytes, image_name, media_type or "image/jpeg")
     claimed["media_type"] = media_type or "image/jpeg"
     claimed["captured_at"] = capture_mod.utc_now()
     claimed["capture_rendered"] = True
+    # Same durable job as the screenshot. Missing title or links stay absent.
+    capture_mod.remember_page_facts(claimed, captured)
     write_job_record(claimed)
     return claimed
 
@@ -1051,10 +1055,8 @@ async def process_ingest_job(job: dict) -> dict:
         try:
             ingest_kwargs = {}
             if claimed.get("capture_kind") == "url":
-                ingest_kwargs["capture"] = capture_mod.capture_store_metadata(
-                    claimed.get("source_url") or "",
-                    claimed.get("captured_at") or "",
-                    claimed.get("image_path") or "",
+                ingest_kwargs["capture"] = capture_mod.capture_metadata_from_record(
+                    claimed
                 )
             reply_text = await ingest_uploaded_image(
                 data,
@@ -1159,18 +1161,19 @@ def _upload_ingest_prompt(
     )
     if not capture:
         return prompt
-    metadata = capture_mod.capture_store_metadata(
-        capture.get("source_url") or "",
-        capture.get("captured_at") or "",
-        capture.get("image_url") or protected_url or "",
+    metadata = capture_mod.capture_metadata_from_record(
+        capture, image_url=protected_url or ""
     )
     return (
         prompt
         + " This image is a screenshot of a public web page. "
         + "You MUST call store_memory and pass custom_metadata that includes "
         + json.dumps(metadata)
-        + ". Copy source_url, captured_at, and capture_kind exactly, and mention "
-        + "the source URL in the description so the page can be recalled later."
+        + ". Copy source_url, captured_at, and capture_kind exactly. "
+        + "When page_title, final_url, or outbound_links are present, copy them "
+        + "exactly too. outbound_links is only URLs and short link text; do not "
+        + "fetch those links and do not store page HTML. "
+        + "Mention the source URL in the description so the page can be recalled later."
     )
 
 

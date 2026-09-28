@@ -124,7 +124,9 @@ def store_memory(
         custom_metadata: Optional structured attributes stored verbatim, e.g.
             {"merchant": "...", "amount": "...", "image_url": "/media/x.jpg"}.
             For a page screenshot, include source_url, captured_at, and
-            capture_kind="url" alongside image_url.
+            capture_kind="url" alongside image_url. When the capture message
+            includes them, also copy page_title, final_url, and outbound_links
+            (a list of {"href": "...", "text": "..."} objects). Do not put page HTML in custom_metadata.
 
     Returns:
         {"status": "stored", "subject": <subject>} on success, or
@@ -175,6 +177,9 @@ root_agent = Agent(
         'RECEIPT: {"merchant":"...","amount":"...","currency":"...","date":"..."}\n'
         "6. When the user message includes source_url, captured_at, and capture_kind, "
         "copy those values into custom_metadata verbatim together with image_url. "
+        "If page_title, final_url, or outbound_links are included, copy them verbatim too. "
+        "outbound_links is a capped list of {href, text} objects; do not fetch those URLs "
+        "and do not store page HTML or page body text in custom_metadata. "
         "Mention the source URL in the description so the page can be recalled later.\n\n"
         "When users ask to recall, find, or browse memories, use `search_memory` or `list_memories`."
     ),

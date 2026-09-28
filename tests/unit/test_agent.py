@@ -25,8 +25,13 @@ def test_agent_instruction_copies_url_capture_metadata():
     assert "capture_kind" in instruction
     assert "source_url" in instruction
     assert "captured_at" in instruction
+    for field in ("page_title", "final_url", "outbound_links"):
+        assert field in instruction
+        assert field in (store_memory.__doc__ or "")
     assert "source_url" in (store_memory.__doc__ or "")
     assert 'capture_kind="url"' in (store_memory.__doc__ or "")
+    assert "do not fetch" in instruction.lower()
+    assert "page HTML" in (store_memory.__doc__ or "")
 
 
 def test_app_structure():

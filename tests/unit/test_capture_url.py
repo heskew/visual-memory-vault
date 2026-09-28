@@ -19,14 +19,23 @@ from PIL import Image
 
 from frontend import capture as capture_mod
 from frontend.capture import (
+    CAPTURE_MAX_LINK_TEXT_CHARS,
+    CAPTURE_MAX_OUTBOUND_LINKS,
+    CAPTURE_MAX_PAGE_TITLE_CHARS,
+    CAPTURE_METADATA_BUDGET_BYTES,
     CHROMIUM_LAUNCH_ARGS,
+    OUTBOUND_LINKS_SCRIPT,
     WEBRTC_DISABLE_SCRIPT,
+    CapturedPage,
     CaptureRejected,
     CaptureTransient,
+    capture_metadata_from_record,
     capture_store_metadata,
+    collect_page_facts,
     ensure_request_allowed,
     fetch_pinned_response,
     handle_capture_route,
+    normalize_outbound_links,
     pin_public_address,
     pin_public_addresses,
     validate_capture_url,
@@ -82,6 +91,218 @@ def test_capture_store_metadata_is_the_flair_shape():
         "captured_at": "2026-09-27T18:00:00Z",
         "capture_kind": "url",
     }
+    assert "page_title" not in metadata
+    assert "final_url" not in metadata
+    assert "outbound_links" not in metadata
+
+
+def test_capture_store_metadata_adds_enrich_fields_when_present():
+    links = [
+        {"href": "https://example.com/a", "text": "Alpha"},
+        {"href": "https://other.example/b#section", "text": "Beta"},
+    ]
+    metadata = capture_store_metadata(
+        "https://example.com/docs",
+        "2026-09-27T18:00:00Z",
+        "/media/page.jpg",
+        page_title="  Example Docs  ",
+        final_url="https://example.com/landed",
+        outbound_links=links,
+    )
+    assert metadata["page_title"] == "Example Docs"
+    assert metadata["final_url"] == "https://example.com/landed"
+    assert metadata["source_url"] == "https://example.com/docs"
+    assert metadata["capture_kind"] == "url"
+    assert metadata["outbound_links"] == links
+    again = capture_metadata_from_record(metadata)
+    assert again == metadata
+
+
+def test_missing_title_and_empty_links_are_omitted():
+    metadata = capture_store_metadata(
+        "https://example.com/docs",
+        "2026-09-27T18:00:00Z",
+        "/media/page.jpg",
+        page_title="   ",
+        final_url="javascript:alert(1)",
+        outbound_links=[],
+    )
+    assert set(metadata) == {"image_url", "source_url", "captured_at", "capture_kind"}
+    same = capture_store_metadata(
+        "https://example.com/docs",
+        "2026-09-27T18:00:00Z",
+        "/media/page.jpg",
+        final_url="https://example.com/docs",
+    )
+    assert same["final_url"] == "https://example.com/docs"
+    assert same["source_url"] == "https://example.com/docs"
+
+
+def test_outbound_links_cap_document_order_and_drop_non_http():
+    raw: list[dict] = [
+        {"href": "javascript:alert(1)", "text": "<script>no</script>"},
+        {"href": "mailto:a@b.c", "text": "mail"},
+        {"href": "https://example.com/docs#section", "text": "This page"},
+        {"href": "https://example.com/a", "text": "  First\nline  "},
+        {"href": "https://example.com/a", "text": "duplicate"},
+        {
+            "href": "https://user:secret@other.example/hidden",
+            "text": "Other <b>bold</b>",
+            "html": "<p>body blob</p>",
+        },
+    ]
+    raw.extend(
+        {"href": f"https://example.com/p/{i}", "text": f"Item {i}"}
+        for i in range(CAPTURE_MAX_OUTBOUND_LINKS)
+    )
+    raw.append(
+        {
+            "href": "https://example.com/too-long-text",
+            "text": "Z" * (CAPTURE_MAX_LINK_TEXT_CHARS + 40),
+        }
+    )
+    links = normalize_outbound_links(raw, page_url="https://example.com/docs")
+    assert len(links) == CAPTURE_MAX_OUTBOUND_LINKS
+    assert links[0] == {"href": "https://example.com/a", "text": "First line"}
+    assert links[1] == {
+        "href": "https://other.example/hidden",
+        "text": "Other bold",
+    }
+    assert all("<" not in link["text"] and "html" not in link for link in links)
+    assert all(not link["href"].startswith("javascript:") for link in links)
+    assert "https://example.com/docs" not in {link["href"] for link in links}
+    assert (
+        links[-1]["href"] == f"https://example.com/p/{CAPTURE_MAX_OUTBOUND_LINKS - 3}"
+    )
+    # The over-long text row is past the cap, so it never lands.
+    assert all(link["href"] != "https://example.com/too-long-text" for link in links)
+
+
+def test_outbound_links_shrink_to_fit_metadata_budget():
+    raw = [
+        {
+            "href": f"https://example.com/p{i}-" + ("a" * 1500),
+            "text": "字" * CAPTURE_MAX_LINK_TEXT_CHARS,
+        }
+        for i in range(CAPTURE_MAX_OUTBOUND_LINKS)
+    ]
+    metadata = capture_store_metadata(
+        "https://example.com/docs",
+        "2026-09-27T18:00:00Z",
+        "/media/page.jpg",
+        page_title="题" * 40,
+        final_url="https://example.com/landed",
+        outbound_links=raw,
+    )
+    assert len(json.dumps(metadata).encode("utf-8")) <= CAPTURE_METADATA_BUDGET_BYTES
+    assert metadata["source_url"] == "https://example.com/docs"
+    assert metadata["capture_kind"] == "url"
+    assert metadata["page_title"] == "题" * 40
+    stored = metadata["outbound_links"]
+    assert isinstance(stored, list)
+    assert 0 < len(stored) < CAPTURE_MAX_OUTBOUND_LINKS
+    assert stored[0]["href"] == raw[0]["href"]
+    assert capture_metadata_from_record(metadata) == metadata
+
+
+def test_link_text_and_title_are_truncated_plain_text():
+    long_text = "W" * (CAPTURE_MAX_LINK_TEXT_CHARS + 25)
+    links = normalize_outbound_links(
+        [{"href": "https://example.com/a", "text": long_text}],
+        page_url="https://start.example/",
+    )
+    assert len(links) == 1
+    assert links[0]["text"] == "W" * CAPTURE_MAX_LINK_TEXT_CHARS
+    assert "<" not in links[0]["text"]
+    metadata = capture_store_metadata(
+        "https://start.example/",
+        "2026-09-27T18:00:00Z",
+        "/media/page.jpg",
+        page_title="T" * (CAPTURE_MAX_PAGE_TITLE_CHARS + 50),
+        final_url="https://user:pw@landed.example/final",
+        outbound_links=[{"href": "not a url", "text": "skip"}, *links],
+    )
+    assert metadata["page_title"] == "T" * CAPTURE_MAX_PAGE_TITLE_CHARS
+    assert metadata["final_url"] == "https://landed.example/final"
+    assert metadata["outbound_links"] == links
+
+
+def test_collect_page_facts_uses_playwright_page_apis():
+    class _Page:
+        def __init__(self):
+            self.url = "https://cdn.example/landed"
+            self.seen = {}
+
+        def title(self):
+            return "  Landed\npage  "
+
+        def locator(self, selector):
+            self.seen["selector"] = selector
+            return self
+
+        def evaluate_all(self, script, arg):
+            self.seen["script"] = script
+            self.seen["arg"] = arg
+            return [
+                {"href": "https://cdn.example/landed#top", "text": "self"},
+                {"href": "javascript:alert(1)", "text": "js"},
+                {"href": "https://cdn.example/next", "text": "Next", "html": "<a>"},
+                "not-a-link",
+            ]
+
+    page = _Page()
+    facts = collect_page_facts(page)
+    assert page.seen["selector"] == "a[href]"
+    assert page.seen["script"] is OUTBOUND_LINKS_SCRIPT
+    assert page.seen["arg"]["max"] == CAPTURE_MAX_OUTBOUND_LINKS
+    assert facts["page_title"] == "Landed page"
+    assert facts["final_url"] == "https://cdn.example/landed"
+    assert facts["outbound_links"] == [
+        {"href": "https://cdn.example/next", "text": "Next"}
+    ]
+
+
+def test_collect_page_facts_is_non_fatal_when_title_and_links_fail():
+    class _Page:
+        url = "about:blank"
+
+        def title(self):
+            raise RuntimeError("no title")
+
+        def locator(self, _selector):
+            raise RuntimeError("no dom")
+
+    facts = collect_page_facts(_Page())
+    assert facts == {"page_title": "", "final_url": "", "outbound_links": []}
+
+
+def test_outbound_link_script_does_not_fetch_or_read_html():
+    assert "a[href]" not in OUTBOUND_LINKS_SCRIPT or "anchors" in OUTBOUND_LINKS_SCRIPT
+    folded = OUTBOUND_LINKS_SCRIPT.lower()
+    for banned in (
+        "innerhtml",
+        "fetch(",
+        "xmlhttprequest",
+        "websocket",
+        "audiocontext",
+        "transcribe",
+    ):
+        assert banned not in folded
+    assert ".href" in OUTBOUND_LINKS_SCRIPT
+    assert "location.href" in OUTBOUND_LINKS_SCRIPT
+    assert "innerText" in OUTBOUND_LINKS_SCRIPT
+    assert r"\s+" in OUTBOUND_LINKS_SCRIPT
+
+
+def test_readme_documents_capture_enrich_fields():
+    readme = Path("README.md").read_text()
+    onboarding = Path("docs/ONBOARDING.md").read_text()
+    for text in (readme, onboarding):
+        assert "page_title" in text
+        assert "final_url" in text
+        assert "outbound_links" in text
+        assert str(CAPTURE_MAX_OUTBOUND_LINKS) in text
+    assert "48KB" in readme
 
 
 def test_upload_prompt_has_no_capture_fields():
@@ -317,6 +538,120 @@ async def test_capture_url_polls_pending_then_succeeded_with_flair_metadata(
     assert record["capture_rendered"] is True
     assert record["captured_at"] == seen["capture"]["captured_at"]
     assert record["source_url"] == "https://example.com/docs"
+
+
+@pytest.mark.asyncio
+async def test_capture_job_stores_enrich_fields_and_keeps_them_on_retry(
+    _capture_env, monkeypatch
+):
+    """Title, final URL, and capped links ride the same job into Flair metadata."""
+    renders = {"n": 0}
+    extra = [
+        {"href": f"https://example.com/p/{i}", "text": f"P{i}"}
+        for i in range(CAPTURE_MAX_OUTBOUND_LINKS + 5)
+    ]
+
+    def render(url: str) -> CapturedPage:
+        renders["n"] += 1
+        assert url == "https://example.com/docs"
+        return CapturedPage(
+            image=_jpeg_bytes(),
+            page_title="Docs title",
+            final_url="https://example.com/landed",
+            outbound_links=tuple(extra),
+        )
+
+    monkeypatch.setattr("frontend.capture.render_page_screenshot", render)
+    seen: list[dict] = []
+
+    async def flaky_ingest(*args, capture=None):
+        seen.append(capture)
+        prompt = _upload_ingest_prompt(args[1], args[3], args[4], capture)
+        assert json.dumps(capture) in prompt
+        assert "do not fetch" in prompt
+        if len(seen) == 1:
+            raise httpx.ConnectError("connection refused")
+        return "Stored the page at https://example.com/docs"
+
+    monkeypatch.setattr("frontend.main.ingest_uploaded_image", flaky_ingest)
+
+    from frontend.main import app
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        accepted = await client.post(
+            "/capture/url",
+            json={"url": "https://example.com/docs", "subject": "Docs"},
+        )
+        assert accepted.status_code == 202
+        assert set(accepted.json()) == {"status", "job_id", "image_path"}
+        job_id = accepted.json()["job_id"]
+        first = await client.post("/ingest", json={"job_id": job_id})
+        assert first.status_code == 503
+        monkeypatch.setattr("frontend.main._ingest_in_flight", set())
+        second = await client.post("/ingest", json={"job_id": job_id})
+        assert second.status_code == 200
+        done = await client.get(f"/jobs/{job_id}")
+        body = done.json()
+        assert body["status"] == "succeeded"
+        assert "page_title" not in body
+        assert "final_url" not in body
+        assert "outbound_links" not in body
+
+    assert renders["n"] == 1
+    assert len(seen) == 2
+    assert seen[0] == seen[1]
+    stored = seen[0]
+    assert stored["source_url"] == "https://example.com/docs"
+    assert stored["capture_kind"] == "url"
+    assert stored["page_title"] == "Docs title"
+    assert stored["final_url"] == "https://example.com/landed"
+    assert len(stored["outbound_links"]) == CAPTURE_MAX_OUTBOUND_LINKS
+    assert stored["outbound_links"][0]["href"] == "https://example.com/p/0"
+    record = load_job(job_id)
+    assert record["page_title"] == "Docs title"
+    assert record["final_url"] == "https://example.com/landed"
+    assert len(record["outbound_links"]) == CAPTURE_MAX_OUTBOUND_LINKS
+
+
+@pytest.mark.asyncio
+async def test_capture_job_succeeds_when_title_and_links_are_missing(
+    _capture_env, monkeypatch
+):
+    def render(_url: str) -> CapturedPage:
+        return CapturedPage(image=_jpeg_bytes())
+
+    monkeypatch.setattr("frontend.capture.render_page_screenshot", render)
+    seen = {}
+
+    async def fake_ingest(*_args, capture=None):
+        seen["capture"] = capture
+        return "stored the screenshot"
+
+    monkeypatch.setattr("frontend.main.ingest_uploaded_image", fake_ingest)
+
+    from frontend.main import app
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        accepted = await client.post(
+            "/capture/url", json={"url": "https://example.com/bare"}
+        )
+        job_id = accepted.json()["job_id"]
+        consumer = await client.post("/ingest", json={"job_id": job_id})
+        assert consumer.status_code == 200
+        assert (await client.get(f"/jobs/{job_id}")).json()["status"] == "succeeded"
+
+    assert set(seen["capture"]) == {
+        "image_url",
+        "source_url",
+        "captured_at",
+        "capture_kind",
+    }
+    assert seen["capture"]["source_url"] == "https://example.com/bare"
+    record = load_job(job_id)
+    assert "page_title" not in record
+    assert "outbound_links" not in record
 
 
 @pytest.mark.asyncio
@@ -794,13 +1129,139 @@ def test_render_disables_webrtc_before_page_scripts(monkeypatch):
     monkeypatch.setitem(sys.modules, "playwright", package)
     monkeypatch.setitem(sys.modules, "playwright.sync_api", sync_api)
 
-    assert _REAL_RENDER("https://example.com/") == b"jpeg-bytes"
+    captured = _REAL_RENDER("https://example.com/")
+    assert isinstance(captured, CapturedPage)
+    assert captured.image == b"jpeg-bytes"
+    assert captured.page_title == ""
+    assert captured.final_url == ""
+    assert captured.outbound_links == ()
     assert "--disable-quic" in launched["args"]
     assert (
         "--force-webrtc-ip-handling-policy=disable_non_proxied_udp" in launched["args"]
     )
     assert "--disable-features=WebRTC" not in launched["args"]
     assert WEBRTC_DISABLE_SCRIPT in launched["context"].scripts
+
+
+def _install_fake_playwright(monkeypatch, page) -> None:
+    class _Context:
+        def add_init_script(self, _script):
+            return None
+
+        def new_page(self):
+            return page
+
+    class _Browser:
+        def new_context(self, **_kwargs):
+            return _Context()
+
+    class _Chromium:
+        def launch(self, headless=None, args=None):
+            return _Browser()
+
+    class _Playwright:
+        def __init__(self):
+            self.chromium = _Chromium()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+    sync_api = types.ModuleType("playwright.sync_api")
+    sync_api.TimeoutError = type("PlaywrightTimeout", (Exception,), {})
+    sync_api.sync_playwright = lambda: _Playwright()
+    package = types.ModuleType("playwright")
+    package.sync_api = sync_api
+    monkeypatch.setitem(sys.modules, "playwright", package)
+    monkeypatch.setitem(sys.modules, "playwright.sync_api", sync_api)
+
+
+def test_render_collects_title_final_url_and_capped_links(monkeypatch):
+    class _Page:
+        url = "https://example.com/after-redirect"
+
+        def set_default_navigation_timeout(self, _ms):
+            return None
+
+        def set_default_timeout(self, _ms):
+            return None
+
+        def route(self, _pattern, _handler):
+            return None
+
+        def goto(self, url, wait_until=None, timeout=None):
+            assert url == "https://example.com/start"
+
+        def title(self):
+            return "After redirect"
+
+        def locator(self, selector):
+            assert selector == "a[href]"
+            return self
+
+        def evaluate_all(self, script, arg):
+            assert "innerHTML" not in script
+            assert "fetch(" not in script
+            rows = [
+                {"href": "https://example.com/after-redirect#x", "text": "here"},
+                {"href": "mailto:a@b.c", "text": "mail"},
+            ]
+            rows.extend(
+                {"href": f"https://other.example/{i}", "text": f"L{i}"}
+                for i in range(arg["max"] + 3)
+            )
+            return rows
+
+        def screenshot(self, type=None, quality=None, full_page=None):
+            return b"jpeg-bytes"
+
+    _install_fake_playwright(monkeypatch, _Page())
+    captured = _REAL_RENDER("https://example.com/start")
+    assert captured.image == b"jpeg-bytes"
+    assert captured.page_title == "After redirect"
+    assert captured.final_url == "https://example.com/after-redirect"
+    assert len(captured.outbound_links) == CAPTURE_MAX_OUTBOUND_LINKS
+    assert captured.outbound_links[0] == {
+        "href": "https://other.example/0",
+        "text": "L0",
+    }
+    assert all(
+        link["href"] != "https://example.com/after-redirect"
+        for link in captured.outbound_links
+    )
+
+
+def test_render_screenshot_survives_fact_collection_errors(monkeypatch):
+    class _Page:
+        def set_default_navigation_timeout(self, _ms):
+            return None
+
+        def set_default_timeout(self, _ms):
+            return None
+
+        def route(self, _pattern, _handler):
+            return None
+
+        def goto(self, _url, wait_until=None, timeout=None):
+            return None
+
+        def title(self):
+            raise RuntimeError("title failed")
+
+        def locator(self, _selector):
+            raise RuntimeError("dom failed")
+
+        def screenshot(self, type=None, quality=None, full_page=None):
+            return b"jpeg-bytes"
+
+    _install_fake_playwright(monkeypatch, _Page())
+    captured = _REAL_RENDER("https://example.com/start")
+    assert captured.image == b"jpeg-bytes"
+    assert captured.page_title == ""
+    assert captured.final_url == ""
+    assert captured.outbound_links == ()
 
 
 _V6 = "2606:4700:4700::1111"
