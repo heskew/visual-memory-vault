@@ -1054,3 +1054,112 @@ def test_unsupported_content_encoding_is_not_fulfilled(monkeypatch):
             ipv6_ok=True,
         )
     assert exc.value.reason == "render_failed"
+
+
+def _compressed_zeros(count: int, *, wbits: int) -> bytes:
+    """Compress ``count`` zero bytes without keeping that buffer around."""
+    compressor = zlib.compressobj(wbits=wbits)
+    parts: list[bytes] = []
+    remaining = count
+    chunk = b"\0" * 65536
+    while remaining:
+        take = min(remaining, len(chunk))
+        parts.append(compressor.compress(chunk[:take]))
+        remaining -= take
+    parts.append(compressor.flush())
+    return b"".join(parts)
+
+
+def _track_capped_inflate(monkeypatch):
+    """Fail the test if inflate asks zlib for an unlimited output buffer."""
+    produced: list[int] = []
+    real = zlib.decompressobj
+    cap = capture_mod.CAPTURE_MAX_SUBRESOURCE_BYTES + 1
+
+    class _Tracking:
+        def __init__(self, wbits=zlib.MAX_WBITS):
+            self._inner = real(wbits)
+
+        def decompress(self, data, max_length=0):
+            if not max_length or max_length > cap:
+                raise AssertionError(f"inflate asked for {max_length} bytes")
+            out = self._inner.decompress(data, max_length)
+            assert len(out) <= cap
+            produced.append(len(out))
+            return out
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    monkeypatch.setattr(capture_mod.zlib, "decompressobj", _Tracking)
+    return produced
+
+
+def _assert_expanding_body_is_rejected(monkeypatch, *, encoding: str, wbits: int):
+    limit = capture_mod.CAPTURE_MAX_SUBRESOURCE_BYTES
+    logical = limit + (1 << 20)
+    payload = _compressed_zeros(logical, wbits=wbits)
+    assert len(payload) < limit
+    produced = _track_capped_inflate(monkeypatch)
+    _patch_pinned_conn(
+        monkeypatch,
+        _PinnedResponse(
+            200,
+            [("Content-Encoding", encoding), ("Content-Type", "text/html")],
+            payload,
+        ),
+    )
+    with pytest.raises(CaptureTransient) as exc:
+        fetch_pinned_response(
+            "GET",
+            "https://example.com/",
+            {"Accept-Encoding": "gzip, deflate, br"},
+            None,
+            resolver=lambda _host: [_V4],
+            ipv6_ok=True,
+        )
+    assert exc.value.reason == "render_failed"
+    assert produced
+    assert sum(produced) < logical
+    assert max(produced) <= limit + 1
+
+
+def test_gzip_bomb_is_rejected_without_full_inflate(monkeypatch):
+    _assert_expanding_body_is_rejected(
+        monkeypatch, encoding="gzip", wbits=16 + zlib.MAX_WBITS
+    )
+
+
+def test_deflate_bomb_is_rejected_without_full_inflate(monkeypatch):
+    _assert_expanding_body_is_rejected(
+        monkeypatch, encoding="deflate", wbits=zlib.MAX_WBITS
+    )
+
+
+def test_raw_deflate_bomb_is_rejected_without_full_inflate(monkeypatch):
+    _assert_expanding_body_is_rejected(
+        monkeypatch, encoding="deflate", wbits=-zlib.MAX_WBITS
+    )
+
+
+def test_inflate_allows_output_exactly_at_the_cap(monkeypatch):
+    monkeypatch.setattr(capture_mod, "CAPTURE_MAX_SUBRESOURCE_BYTES", 128)
+    plain = b"A" * 128
+    _patch_pinned_conn(
+        monkeypatch,
+        _PinnedResponse(
+            200,
+            [("Content-Encoding", "gzip"), ("Content-Type", "text/plain")],
+            gzip.compress(plain),
+        ),
+    )
+    _status, headers, body = fetch_pinned_response(
+        "GET",
+        "https://example.com/",
+        None,
+        None,
+        resolver=lambda _host: [_V4],
+        ipv6_ok=True,
+    )
+    assert body == plain
+    assert all(key.lower() != "content-encoding" for key in headers)

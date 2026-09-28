@@ -11,7 +11,6 @@ upload path.
 
 from __future__ import annotations
 
-import gzip
 import http.client
 import ipaddress
 import os
@@ -396,16 +395,45 @@ def _is_top_level_document(request) -> bool:
     return getattr(frame, "parent_frame", None) is None
 
 
+def _decompress_capped(payload: bytes, wbits: int) -> bytes:
+    """Inflate ``payload`` without going past the subresource cap.
+
+    ``decompress(..., max_length=room + 1)`` never returns the rest of a
+    bomb, so a small gzip or deflate body cannot expand into an unbounded
+    buffer. One extra byte is enough to see that the cap would be crossed;
+    that byte is not kept.
+    """
+    limit = CAPTURE_MAX_SUBRESOURCE_BYTES
+    decompressor = zlib.decompressobj(wbits)
+    out = bytearray()
+    pending = payload
+    while not decompressor.eof:
+        room = limit - len(out)
+        produced = decompressor.decompress(pending, room + 1)
+        if len(produced) > room:
+            raise CaptureTransient("render_failed")
+        out.extend(produced)
+        nxt = decompressor.unconsumed_tail
+        if decompressor.eof:
+            break
+        if not produced and nxt == pending:
+            raise zlib.error("incomplete compressed stream")
+        pending = nxt
+    return bytes(out)
+
+
 def _inflate_content_encoding(encoding: str, body: bytes) -> bytes:
     """Return uncompressed bytes. Unknown encodings are not passed through."""
     try:
         if encoding in {"gzip", "x-gzip"}:
-            return gzip.decompress(body)
+            return _decompress_capped(body, 16 + zlib.MAX_WBITS)
         if encoding == "deflate":
             try:
-                return zlib.decompress(body)
+                return _decompress_capped(body, zlib.MAX_WBITS)
             except zlib.error:
-                return zlib.decompress(body, -zlib.MAX_WBITS)
+                return _decompress_capped(body, -zlib.MAX_WBITS)
+    except CaptureTransient:
+        raise
     except (OSError, zlib.error, ValueError) as exc:
         raise CaptureTransient("render_failed") from exc
     raise CaptureTransient("render_failed")
