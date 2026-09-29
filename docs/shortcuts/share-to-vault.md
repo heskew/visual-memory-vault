@@ -8,13 +8,13 @@ Until that link exists, build the shortcut from the steps below. The steps use o
 
 ## What it sends
 
-The live proxy is the only host this shortcut accepts:
+The shortcut calls whatever proxy base URL is saved on that phone. It does not name a shared host. Paste your own origin, `https://YOUR_VAULT_PROXY`: https, host only, no path, no API key. The shortcut then posts to:
 
-`https://visual-memory-vault-proxy-151358874679.us-east1.run.app`
+- `https://YOUR_VAULT_PROXY/upload`
+- `https://YOUR_VAULT_PROXY/capture/stitch`
+- `https://YOUR_VAULT_PROXY/capture/url`
 
-- `https://visual-memory-vault-proxy-151358874679.us-east1.run.app/upload`
-- `https://visual-memory-vault-proxy-151358874679.us-east1.run.app/capture/stitch`
-- `https://visual-memory-vault-proxy-151358874679.us-east1.run.app/capture/url`
+`https://YOUR_VAULT_PROXY` is a placeholder, not a server.
 
 | Share sheet input | Request | Body |
 | --- | --- | --- |
@@ -54,11 +54,11 @@ Auth is the header production upload already uses: `X-Api-Key` set to the proxy 
 2. Tap the shortcut name, then the receive line at the top. Set it to **Receive Images, URLs, and Safari web pages input from Share Sheet**.
 3. Turn on **Show in Share Sheet**. Share types: Images, URLs, Safari web pages.
 4. Add the actions in the next section, in order.
-5. In the first **Text** action, put the live proxy URL above (no path, no key).
-6. In the second **Text** action, put the proxy API key.
-7. Those two text actions are the saved values. The next share does not ask again.
+5. In the first **Text** action, paste your proxy base URL (`https://YOUR_VAULT_PROXY`: https, host only, no path, no key). Leave this action empty in the copy you publish.
+6. In the second **Text** action, put your proxy API key. Leave this action empty in the copy you publish.
+7. On your phone those two text actions are the saved values. The next share does not ask again. Importers are asked once, and nothing is prefilled.
 
-Confirm one photo, two photos, and a Safari page. Each result should be `Queued` plus a `job_id`, not a written summary of the picture. Then publish, using the section after the actions, so the key is not inside the shared shortcut.
+Confirm one photo, two photos, and a Safari page. Each result should be `Queued` plus a `job_id`, not a written summary of the picture. Then publish, using the section after the actions, so your base URL and key are not inside the shared shortcut.
 
 ## Actions
 
@@ -66,37 +66,83 @@ Search names are the labels in the Shortcuts app. Tap an action's result and cho
 
 ### 1. Base URL and API key
 
-**Text.** Contents: the live proxy URL. Rename the result `Vault Base URL`.
+**Text.** Contents: empty in the published shortcut. Rename the result `Vault Base URL`. This is a required **Import Question** with no default answer. The importer pastes their own proxy base URL.
 
-**Text.** Contents: the API key, on this phone only. Rename the result `Vault API Key`.
+**Text.** Contents: empty in the published shortcut. Rename the result `Vault API Key`. This is an **Import Question** with no default answer.
 
-Before you publish, both fields become **Import Question**s (see below). The shared copy must not contain the key.
+On a phone where you are building the shortcut for yourself, type your own base URL and key into those two actions. Clear both before you publish. The shared copy must not contain either value. There is no fixed host to compare against.
 
-### 2. Allow only that host
+### 2. Check the saved base URL
 
-**If** `Vault Base URL` **is** `https://visual-memory-vault-proxy-151358874679.us-east1.run.app/`
+Use the saved `Vault Base URL`. Do not add an action that matches one production hostname. The check only rejects a value that is not https, or that includes a path, a query, a fragment, or a key.
 
-- **Text.** Contents: `https://visual-memory-vault-proxy-151358874679.us-east1.run.app`
-- **Set Variable.** Variable name `Vault Base URL`, value that text.
-
-**End If**
-
-**If** `Vault Base URL` **is** `https://visual-memory-vault-proxy-151358874679.us-east1.run.app`
-
-- **Nothing**
-
-**Otherwise**
+**If** `Vault Base URL` **does not have any value**
 
 - **Stop and Output**
 
 ```text
 Not queued
-Vault base URL must be https://visual-memory-vault-proxy-151358874679.us-east1.run.app
+Paste your Vault proxy base URL. Nothing was sent.
 ```
 
 **End If**
 
-A different host, an `http://` URL, a path, or a key in the URL stops here. Nothing is sent. Localhost is for curl, not this shortcut.
+**If** `Vault Base URL` **does not begin with** `https://`
+
+- **Stop and Output**
+
+```text
+Not queued
+Vault base URL must start with https:// and include only the host. Nothing was sent.
+```
+
+**End If**
+
+Repeat that same stop for each of these **If** `Vault Base URL` **contains** checks: `?`, `#`, `@`, and a space. A query, a fragment, userinfo, or a space can hide a key. Nothing is sent.
+
+**Split Text.** Split `Vault Base URL` by the custom separator `/`. Rename the result `URL Parts`.
+
+**Count.** Input: `URL Parts`. Rename `URL Part Count`.
+
+**Get Item from List.** List: `URL Parts`. Item at index `1`. **If** it **is not** `https:`
+
+- **Stop and Output** the same https message as above.
+
+**End If**
+
+**Get Item from List.** List: `URL Parts`. Item at index `3`. Rename `Vault Host`.
+
+**If** `URL Part Count` **is** `3`
+
+- **If** `Vault Host` **has any value**
+  - **Text.** `https://` followed immediately by `Vault Host`.
+  - **Set Variable.** Variable name `Vault Base URL`, value that text.
+- **Otherwise**
+  - **Stop and Output**
+
+```text
+Not queued
+Vault base URL must be https:// and the host only, with no path and no key. Nothing was sent.
+```
+
+- **End If**
+
+**Otherwise**
+
+- **If** `URL Part Count` **is** `4`
+  - **Get Item from List.** List: `URL Parts`. Item at index `4`. Rename `URL Tail`.
+  - **If** `URL Tail` **has any value**
+    - **Stop and Output** the host-only message above. A path was present. Nothing is sent.
+  - **Otherwise**
+    - The extra piece is a trailing slash. **If** `Vault Host` **has any value**, set `Vault Base URL` to `https://` plus `Vault Host`. **Otherwise**, stop with the host-only message.
+  - **End If**
+- **Otherwise**
+  - **Stop and Output** the host-only message. Nothing is sent.
+- **End If**
+
+**End If**
+
+`https://YOUR_VAULT_PROXY` and `https://YOUR_VAULT_PROXY/` both become `https://YOUR_VAULT_PROXY`. `http://`, a path, `?key=`, and `user:pass@host` stop here. Curl to `http://localhost:8080` is separate; this shortcut asks for https.
 
 **If** `Vault API Key` **does not have any value**
 
@@ -312,10 +358,10 @@ Vault did not accept this share.
 Do this from the phone that should sign the shortcut, after a real share has worked.
 
 1. Open **Share to Vault** in Shortcuts.
-2. Clear the API key **Text** action. Leave the base URL text as the live proxy host, or clear it too.
-3. Tap the base URL text inside its **Text** action → **Import Question**. Question: `Vault base URL`. Default answer: `https://visual-memory-vault-proxy-151358874679.us-east1.run.app`.
-4. Tap the API key **Text** action's text → **Import Question**. Question: `Vault API key (X-Api-Key)`. Leave the default answer empty.
-5. Confirm the key is not still written in any action.
+2. Clear the base URL **Text** action and the API key **Text** action. The shared shortcut must not contain a host or a key.
+3. Tap the base URL **Text** action → **Import Question**. Question: `Vault base URL. Paste your proxy origin (https, host only, no path, no API key).` Leave the default answer empty. This question is required: the shortcut stops if the answer is blank.
+4. Tap the API key **Text** action → **Import Question**. Question: `Vault API key (X-Api-Key)`. Leave the default answer empty.
+5. Confirm neither value is still written in any action, and that no action names a fixed host.
 6. Tap the share button on the shortcut → **Copy iCloud Link**.
 
 The link is signed by that Apple ID. Anyone who adds it sees the actions first, including the host check, and is asked the two questions once. The answers stay in their copy of the shortcut. They are not part of the link. The next share from Photos or Safari uses the saved answers.
@@ -329,7 +375,7 @@ Put the new link in this file where the placeholder is, and in the README Mobile
 Not part of the share. After you have a `job_id`, a terminal or a separate shortcut can check:
 
 ```bash
-curl "https://visual-memory-vault-proxy-151358874679.us-east1.run.app/jobs/<job_id>" \
+curl "https://YOUR_VAULT_PROXY/jobs/<job_id>" \
   -H "X-Api-Key: <YOUR_PROXY_KEY>"
 ```
 
@@ -342,6 +388,7 @@ curl "https://visual-memory-vault-proxy-151358874679.us-east1.run.app/jobs/<job_
 - Nine photos → `Not queued` / `Share 8 images or fewer.` No request.
 - Safari share on a public page → `Queued`, and `image_path` ends in `_page.jpg`.
 - A non-http share with no image → `Not queued` / `That link is not http or https. Nothing was sent.`
-- A base URL other than the live proxy → `Not queued` and the host sentence. No request.
+- An empty base URL → `Not queued` / `Paste your Vault proxy base URL. Nothing was sent.`
+- A base URL that is `http://`, has a path, or includes `?`, `#`, or `@` → `Not queued` and the host-only sentence. No request.
 - A wrong API key → `Not queued` and the proxy's unauthorized `detail`.
 - The result does not contain a receipt summary. That work happens after `202`.

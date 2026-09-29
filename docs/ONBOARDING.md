@@ -95,9 +95,9 @@ agents-cli deploy \
 
 ### Step 4: Verify Live End-to-End Recall
 
-1. Send an image upload from your phone via the Cloud Run proxy (send-and-forget; expect `202 Accepted` with `job_id` + `image_path`, not an agent writeup):
+1. Send an image upload from your phone via your proxy (send-and-forget; expect `202 Accepted` with `job_id` + `image_path`, not an agent writeup). Replace `https://YOUR_VAULT_PROXY` with that origin:
    ```bash
-   curl -X POST https://visual-memory-vault-proxy-151358874679.us-east1.run.app/upload \
+   curl -X POST https://YOUR_VAULT_PROXY/upload \
      -H "X-Api-Key: <YOUR_PROXY_KEY>" \
      -F "file=@receipt.jpg" \
      -F "subject=Test Onboarding"
