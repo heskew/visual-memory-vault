@@ -127,6 +127,9 @@ def store_memory(
             capture_kind="url" alongside image_url. When the capture message
             includes them, also copy page_title, final_url, and outbound_links
             (a list of {"href": "...", "text": "..."} objects). Do not put page HTML in custom_metadata.
+            For a stitched stack of screenshots, include capture_kind="stitch",
+            source_image_ids (the input ids in stack order), and captured_at
+            alongside image_url.
 
     Returns:
         {"status": "stored", "subject": <subject>} on success, or
@@ -180,7 +183,12 @@ root_agent = Agent(
         "If page_title, final_url, or outbound_links are included, copy them verbatim too. "
         "outbound_links is a capped list of {href, text} objects; do not fetch those URLs "
         "and do not store page HTML or page body text in custom_metadata. "
-        "Mention the source URL in the description so the page can be recalled later.\n\n"
+        "Mention the source URL in the description so the page can be recalled later.\n"
+        '7. When the user message includes capture_kind "stitch" together with '
+        "source_image_ids and captured_at, copy those values into custom_metadata "
+        "verbatim together with image_url. source_image_ids is the list of input ids "
+        "in stack order. Mention that the memory is a composed stack of screenshots "
+        "so it can be recalled later.\n\n"
         "When users ask to recall, find, or browse memories, use `search_memory` or `list_memories`."
     ),
     tools=flair_tools,

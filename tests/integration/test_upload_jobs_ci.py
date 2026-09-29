@@ -26,8 +26,15 @@ from a2a.client import A2AClientError, AgentCardResolutionError
 from httpx import ASGITransport, AsyncClient
 from PIL import Image
 
+from frontend import stitch as stitch_mod
 from frontend.capture import CAPTURE_MAX_OUTBOUND_LINKS, CapturedPage, CaptureRejected
-from frontend.main import EnqueueError, PersistError, drain_pending_ingest_jobs
+from frontend.main import (
+    EnqueueError,
+    PersistError,
+    drain_pending_ingest_jobs,
+    load_job,
+    persist_uploaded_image,
+)
 
 
 def _jpeg_bytes() -> bytes:
@@ -666,3 +673,150 @@ async def test_capture_url_metadata_includes_title_final_url_and_links(
     record = json.loads((proxy_env / "jobs" / f"{job_id}.json").read_text())
     assert record["page_title"] == "Example docs"
     assert len(record["outbound_links"]) == CAPTURE_MAX_OUTBOUND_LINKS
+
+
+def _solid_jpeg(width: int, height: int, color: tuple[int, int, int]) -> bytes:
+    buf = io.BytesIO()
+    Image.new("RGB", (width, height), color).save(buf, format="JPEG")
+    return buf.getvalue()
+
+
+def _stitch_files(*blobs: bytes) -> list[tuple[str, tuple[str, bytes, str]]]:
+    return [
+        ("file", (f"part-{index}.jpg", blob, "image/jpeg"))
+        for index, blob in enumerate(blobs)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_capture_stitch_202_then_poll_succeeded(client, proxy_env, monkeypatch):
+    """POST /capture/stitch matches the upload 202 contract; the worker stacks later."""
+    calls = {"n": 0}
+    real = stitch_mod.compose_vertical_jpeg
+
+    def counting(parts):
+        calls["n"] += 1
+        return real(parts)
+
+    monkeypatch.setattr(stitch_mod, "compose_vertical_jpeg", counting)
+    seen = {}
+
+    async def fake_ingest(*args, stitch=None, **kwargs):
+        seen["stitch"] = stitch
+        seen["filename"] = args[1]
+        seen["subject"] = args[4]
+        return "Stored the stitched screenshots"
+
+    monkeypatch.setattr("frontend.main.ingest_uploaded_image", fake_ingest)
+    top = _solid_jpeg(10, 12, (180, 20, 20))
+    bottom = _solid_jpeg(10, 8, (20, 20, 180))
+    started = time.monotonic()
+    accepted = await client.post(
+        "/capture/stitch?wait=1",
+        files=_stitch_files(top, bottom),
+        data={"subject": "Weekend"},
+    )
+    assert time.monotonic() - started < 2
+    assert calls["n"] == 0
+    assert accepted.status_code == 202
+    body = accepted.json()
+    assert set(body) == {"status", "job_id", "image_path"}
+    assert body["status"] == "accepted"
+    assert body["image_path"].endswith("_stitch.jpg")
+    job_id = body["job_id"]
+    pending = await client.get(f"/jobs/{job_id}")
+    assert pending.json()["status"] == "pending"
+    record = load_job(job_id)
+    assert record["capture_kind"] == "stitch"
+    assert record["subject"] == "Weekend"
+    assert len(record["source_image_ids"]) == 2
+    assert record["source_image_ids"][0] != record["source_image_ids"][1]
+    assert not (proxy_env / body["image_path"].rsplit("/", 1)[-1]).exists()
+
+    monkeypatch.setattr("frontend.main._ingest_in_flight", set())
+    consumer = await client.post("/ingest", json={"job_id": job_id})
+    assert consumer.status_code == 200
+    assert consumer.json()["completed"] == [job_id]
+    done = await client.get(f"/jobs/{job_id}")
+    assert done.json()["status"] == "succeeded"
+    assert done.json()["summary"] == "Stored the stitched screenshots"
+    assert calls["n"] == 1
+    stored = (proxy_env / body["image_path"].rsplit("/", 1)[-1]).read_bytes()
+    assert stored.startswith(b"\xff\xd8")
+    with Image.open(io.BytesIO(stored)) as stacked:
+        assert stacked.size == (10, 20)
+    assert seen["stitch"]["capture_kind"] == "stitch"
+    assert seen["stitch"]["source_image_ids"] == record["source_image_ids"]
+    assert seen["stitch"]["image_url"] == body["image_path"]
+    assert seen["stitch"]["captured_at"].endswith("Z")
+    assert "source_url" not in seen["stitch"]
+    assert seen["filename"] == "stitch.jpg"
+    assert seen["subject"] == "Weekend"
+
+
+@pytest.mark.asyncio
+async def test_capture_stitch_rejects_bad_inputs_and_failed_decode(
+    client, proxy_env, monkeypatch
+):
+    jpeg = _solid_jpeg(6, 6, (40, 40, 40))
+    missing = await client.post(
+        "/capture/stitch",
+        files={"subject": (None, "only")},
+    )
+    assert missing.status_code == 400
+    assert missing.json()["detail"] == "At least 2 images are required"
+    single = await client.post(
+        "/capture/stitch",
+        files={"file": ("only.jpg", jpeg, "image/jpeg")},
+    )
+    assert single.status_code == 400
+    too_many = await client.post(
+        "/capture/stitch",
+        files=_stitch_files(*([jpeg] * (stitch_mod.STITCH_MAX_IMAGES + 1))),
+    )
+    assert too_many.status_code == 400
+    assert "8" in too_many.json()["detail"]
+    gif = await client.post(
+        "/capture/stitch",
+        files=[
+            ("file", ("a.jpg", jpeg, "image/jpeg")),
+            ("file", ("b.gif", b"GIF89ahello", "image/gif")),
+        ],
+    )
+    assert gif.status_code == 415
+
+    accepted = await client.post("/capture/stitch", files=_stitch_files(jpeg, jpeg))
+    assert accepted.status_code == 202
+    job_id = accepted.json()["job_id"]
+    source = load_job(job_id)["source_images"][0]["image_name"]
+    (proxy_env / source).write_bytes(b"not-a-real-image")
+    monkeypatch.setattr("frontend.main._ingest_in_flight", set())
+    failed = await client.post("/ingest", json={"job_id": job_id})
+    assert failed.status_code == 200
+    assert (await client.get(f"/jobs/{job_id}")).json()["error"] == "unsupported_image"
+    monkeypatch.setattr("frontend.main._ingest_in_flight", set())
+    await client.post("/ingest", json={"job_id": job_id})
+    assert (await client.get(f"/jobs/{job_id}")).json()["status"] == "failed"
+
+    async def succeed(*_args, **_kwargs):
+        return "ok"
+
+    monkeypatch.setattr("frontend.main.ingest_uploaded_image", succeed)
+
+    def blip(data, name, media):
+        if str(name).endswith("_stitch.jpg"):
+            raise PersistError("blip")
+        return persist_uploaded_image(data, name, media)
+
+    monkeypatch.setattr("frontend.main.persist_uploaded_image", blip)
+    retry = await client.post("/capture/stitch", files=_stitch_files(jpeg, jpeg))
+    retry_id = retry.json()["job_id"]
+    monkeypatch.setattr("frontend.main._ingest_in_flight", set())
+    first = await client.post("/ingest", json={"job_id": retry_id})
+    assert first.status_code == 503
+    assert (await client.get(f"/jobs/{retry_id}")).json()["status"] == "pending"
+    monkeypatch.setattr("frontend.main.persist_uploaded_image", persist_uploaded_image)
+    monkeypatch.setattr("frontend.main._ingest_in_flight", set())
+    second = await client.post("/ingest", json={"job_id": retry_id})
+    assert second.status_code == 200
+    assert (await client.get(f"/jobs/{retry_id}")).json()["status"] == "succeeded"

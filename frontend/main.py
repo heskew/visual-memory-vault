@@ -17,8 +17,10 @@ import httpx
 
 try:
     from frontend import capture as capture_mod
+    from frontend import stitch as stitch_mod
 except ImportError:  # python frontend/main.py, or the proxy image's python main.py
     import capture as capture_mod
+    import stitch as stitch_mod
 from a2a.client import (
     A2AClientError,
     A2AClientTimeoutError,
@@ -49,6 +51,7 @@ from fastapi.staticfiles import StaticFiles
 from google.cloud import storage
 from google.protobuf.json_format import ParseDict
 from PIL import Image, ImageFile
+from starlette.datastructures import UploadFile as StarletteUploadFile
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
@@ -618,6 +621,8 @@ def enqueue_ingest_job(
     *,
     source_url: str | None = None,
     capture_kind: str | None = None,
+    source_image_ids: list[str] | None = None,
+    source_images: list[dict] | None = None,
 ) -> dict:
     """Write a pending job to the durable store. Raises EnqueueError on failure."""
     job = {
@@ -636,7 +641,13 @@ def enqueue_ingest_job(
         "date": None,
         "error": None,
     }
-    if source_url or capture_kind:
+    if capture_kind == "stitch":
+        job["capture_kind"] = "stitch"
+        job["captured_at"] = None
+        job["capture_rendered"] = False
+        job["source_image_ids"] = list(source_image_ids or [])
+        job["source_images"] = [dict(item) for item in (source_images or [])]
+    elif source_url or capture_kind:
         job["source_url"] = source_url
         job["capture_kind"] = capture_kind or "url"
         job["captured_at"] = None
@@ -857,6 +868,10 @@ def claim_ingest_job(job_id: str) -> dict | None:
 
 
 def load_uploaded_image_bytes(image_name: str) -> bytes | None:
+    """Best-effort image load. GCS errors return None, same as a missing object.
+
+    Stitch must tell those apart; use ``load_stitch_media_bytes`` there.
+    """
     local_path = os.path.join(MEDIA_DIR, image_name)
     if os.path.exists(local_path):
         with open(local_path, "rb") as f:
@@ -872,6 +887,49 @@ def load_uploaded_image_bytes(image_name: str) -> bytes | None:
         except Exception as e:
             print(f"Warning: Failed to load image for ingest job: {e}")
     return None
+
+
+def load_stitch_media_bytes(image_name: str) -> bytes | None:
+    """Load one stitch source or the composed JPEG.
+
+    Returns None only when the object is confirmed absent. A local IO error or
+    a GCS read/exists failure raises ``StitchTransient`` (``gcs_read_failed``)
+    so the job stays pending. Upload and URL capture keep using
+    ``load_uploaded_image_bytes``.
+    """
+    local_path = os.path.join(MEDIA_DIR, image_name)
+    try:
+        local_exists = os.path.exists(local_path)
+    except OSError as exc:
+        print(f"Warning: Failed to stat stitch image {image_name}: {exc}")
+        raise stitch_mod.StitchTransient("gcs_read_failed") from exc
+    if local_exists:
+        try:
+            with open(local_path, "rb") as handle:
+                return handle.read()
+        except OSError as exc:
+            print(f"Warning: Failed to read stitch image {image_name}: {exc}")
+            raise stitch_mod.StitchTransient("gcs_read_failed") from exc
+
+    if not GCS_BUCKET_NAME:
+        return None
+
+    try:
+        gcs = _get_gcs_client()
+        if not gcs:
+            raise stitch_mod.StitchTransient("gcs_read_failed")
+        blob = gcs.bucket(GCS_BUCKET_NAME).blob(f"vault-images/{image_name}")
+        if not blob.exists():
+            return None
+        payload = blob.download_as_bytes()
+    except stitch_mod.StitchTransient:
+        raise
+    except Exception as exc:
+        print(f"Warning: Failed to load stitch image {image_name}: {exc}")
+        raise stitch_mod.StitchTransient("gcs_read_failed") from exc
+    if payload is None:
+        raise stitch_mod.StitchTransient("gcs_read_failed")
+    return payload
 
 
 def list_pending_ingest_jobs() -> list[dict]:
@@ -1003,6 +1061,67 @@ async def _ensure_url_screenshot(claimed: dict) -> dict:
     return claimed
 
 
+def _safe_media_name(name: object) -> str:
+    if not isinstance(name, str) or not name or os.path.basename(name) != name:
+        raise stitch_mod.StitchRejected("stitch_source_missing")
+    if name in {".", ".."}:
+        raise stitch_mod.StitchRejected("stitch_source_missing")
+    return name
+
+
+async def _ensure_stitched_image(claimed: dict) -> dict:
+    """Stack stitch inputs into the reserved JPEG before extract/store.
+
+    Upload and URL jobs return unchanged. A JPEG already in the durable store
+    is not composed again, so a Cloud Tasks retry continues at extract.
+    Source ids are the ones minted at accept time. A GCS or IO blip while
+    reading the composed JPEG or a source stays pending; only a confirmed-absent
+    source is ``stitch_source_missing``.
+    """
+    if claimed.get("capture_kind") != "stitch":
+        return claimed
+    image_name = _safe_media_name(claimed.get("image_name"))
+    sources = claimed.get("source_images")
+    source_ids = claimed.get("source_image_ids")
+    if (
+        not isinstance(sources, list)
+        or not isinstance(source_ids, list)
+        or len(sources) < 2
+        or len(source_ids) < 2
+    ):
+        raise stitch_mod.StitchRejected("too_few_images")
+    if len(sources) > stitch_mod.STITCH_MAX_IMAGES:
+        raise stitch_mod.StitchRejected("too_many_images")
+    if len(sources) != len(source_ids):
+        raise stitch_mod.StitchRejected("stitch_source_missing")
+    if load_stitch_media_bytes(image_name):
+        if not claimed.get("captured_at"):
+            claimed["captured_at"] = stitch_mod.utc_now()
+            claimed["capture_rendered"] = True
+            write_job_record(claimed)
+        return claimed
+    blobs: list[bytes] = []
+    for source, source_id in zip(sources, source_ids, strict=True):
+        if not isinstance(source, dict) or source.get("id") != source_id:
+            raise stitch_mod.StitchRejected("stitch_source_missing")
+        data = load_stitch_media_bytes(_safe_media_name(source.get("image_name")))
+        if data is None:
+            raise stitch_mod.StitchRejected("stitch_source_missing")
+        blobs.append(data)
+    try:
+        jpeg = await asyncio.to_thread(stitch_mod.compose_vertical_jpeg, blobs)
+    except stitch_mod.StitchRejected:
+        raise
+    except MemoryError as exc:
+        raise stitch_mod.StitchRejected("stitch_too_large") from exc
+    persist_uploaded_image(jpeg, image_name, "image/jpeg")
+    claimed["media_type"] = "image/jpeg"
+    claimed["captured_at"] = stitch_mod.utc_now()
+    claimed["capture_rendered"] = True
+    write_job_record(claimed)
+    return claimed
+
+
 async def _commit_succeeded_job(job: dict) -> dict:
     """Persist store-commit then the job. Retry the job write, never extract/store."""
     job["status"] = "succeeded"
@@ -1037,25 +1156,46 @@ async def process_ingest_job(job: dict) -> dict:
     if claimed is None:
         return load_job(job_id) or job
     _ingest_in_flight.add(job_id)
+    stitch_bytes: bytes | None = None
     try:
         try:
             claimed = await _ensure_url_screenshot(claimed)
+            claimed = await _ensure_stitched_image(claimed)
+            if claimed.get("capture_kind") == "stitch":
+                stitch_bytes = load_stitch_media_bytes(
+                    _safe_media_name(claimed.get("image_name"))
+                )
+                if not stitch_bytes:
+                    raise stitch_mod.StitchRejected("image_missing")
         except capture_mod.CaptureRejected as exc:
             print(f"Error: capture job {job_id} rejected: {exc.reason}")
             return _mark_job_failed(claimed, _safe_reason(exc.reason))
         except capture_mod.CaptureTransient as exc:
             print(f"Warning: transient capture error for {job_id}: {exc.reason}")
             return _release_job_for_retry(claimed)
+        except stitch_mod.StitchRejected as exc:
+            print(f"Error: stitch job {job_id} rejected: {exc.reason}")
+            return _mark_job_failed(claimed, _safe_reason(exc.reason))
+        except stitch_mod.StitchTransient as exc:
+            print(f"Warning: transient stitch error for {job_id}: {exc.reason}")
+            return _release_job_for_retry(claimed)
         except (PersistError, EnqueueError) as exc:
             print(f"Warning: transient capture persist error for {job_id}: {exc}")
             return _release_job_for_retry(claimed)
-        data = load_uploaded_image_bytes(claimed["image_name"])
-        if not data:
-            return _mark_job_failed(claimed, "image_missing")
+        if stitch_bytes is None:
+            data = load_uploaded_image_bytes(claimed["image_name"])
+            if not data:
+                return _mark_job_failed(claimed, "image_missing")
+        else:
+            data = stitch_bytes
         try:
             ingest_kwargs = {}
             if claimed.get("capture_kind") == "url":
                 ingest_kwargs["capture"] = capture_mod.capture_metadata_from_record(
+                    claimed
+                )
+            elif claimed.get("capture_kind") == "stitch":
+                ingest_kwargs["stitch"] = stitch_mod.stitch_metadata_from_record(
                     claimed
                 )
             reply_text = await ingest_uploaded_image(
@@ -1147,8 +1287,12 @@ def _upload_ingest_prompt(
     protected_url: str,
     subject: str | None,
     capture: dict | None = None,
+    stitch: dict | None = None,
 ) -> str:
-    subject_context = subject or ("Page capture" if capture else "Mobile upload")
+    if stitch:
+        subject_context = subject or "Stitched screenshots"
+    else:
+        subject_context = subject or ("Page capture" if capture else "Mobile upload")
     prompt = (
         f"I uploaded a photo/screenshot named '{filename}'. "
         f"Protected Media Relative Path: {protected_url or 'N/A'}. "
@@ -1159,6 +1303,20 @@ def _upload_ingest_prompt(
         "pass them in store_memory custom_metadata together with image_url, keep the prose description, "
         'and include one reply line of the form RECEIPT: {"merchant":"...","amount":"...","currency":"...","date":"..."}'
     )
+    if stitch:
+        metadata = stitch_mod.stitch_metadata_from_record(
+            stitch, image_url=protected_url or ""
+        )
+        return (
+            prompt
+            + " This image is a vertical stack of screenshots composed into one JPEG, "
+            + "top to bottom in the order they were sent. "
+            + "You MUST call store_memory and pass custom_metadata that includes "
+            + json.dumps(metadata)
+            + ". Copy capture_kind, source_image_ids, and captured_at exactly. "
+            + "source_image_ids lists the input ids in stack order. "
+            + "Mention that this memory is a composed stack of screenshots so it can be recalled later."
+        )
     if not capture:
         return prompt
     metadata = capture_mod.capture_metadata_from_record(
@@ -1184,9 +1342,10 @@ async def ingest_uploaded_image(
     protected_url: str,
     subject: str | None,
     capture: dict | None = None,
+    stitch: dict | None = None,
 ) -> str:
     """Send the image through A2A for extract + store_memory. Returns reply text."""
-    prompt = _upload_ingest_prompt(filename, protected_url, subject, capture)
+    prompt = _upload_ingest_prompt(filename, protected_url, subject, capture, stitch)
 
     async with httpx.AsyncClient(headers=_auth_headers(), timeout=120) as client:
         card = await _get_card(client)
@@ -1325,6 +1484,99 @@ async def capture_url(
         raise HTTPException(
             status_code=500, detail="Failed to persist capture"
         ) from exc
+    return JSONResponse(
+        {
+            "status": "accepted",
+            "job_id": job["job_id"],
+            "image_path": protected_url,
+        },
+        status_code=202,
+    )
+
+
+async def _read_stitch_form(req: Request) -> tuple[list[bytes], str | None]:
+    """Multipart image parts plus optional subject. Does not fetch URLs."""
+    content_type = req.headers.get("content-type", "")
+    if "multipart/form-data" not in content_type.lower():
+        raise HTTPException(
+            status_code=400, detail="Request body must be multipart form data"
+        )
+    try:
+        form = await req.form()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400, detail="Request body must be multipart form data"
+        ) from exc
+    files: list[UploadFile] = []
+    subject: str | None = None
+    saw_subject = False
+    for key, value in form.multi_items():
+        if isinstance(value, StarletteUploadFile):
+            files.append(value)
+            continue
+        if key != "subject" or saw_subject:
+            continue
+        saw_subject = True
+        if not isinstance(value, str):
+            raise HTTPException(status_code=400, detail="subject must be a string")
+        subject = value.strip()[:500] or None
+    if len(files) < 2:
+        status, detail = stitch_mod.http_for_reason("too_few_images")
+        raise HTTPException(status_code=status, detail=detail)
+    if len(files) > stitch_mod.STITCH_MAX_IMAGES:
+        status, detail = stitch_mod.http_for_reason("too_many_images")
+        raise HTTPException(status_code=status, detail=detail)
+    blobs: list[bytes] = []
+    limit = stitch_mod.STITCH_MAX_IMAGE_BYTES + 1
+    for upload in files:
+        blob = await upload.read(limit)
+        await upload.close()
+        if len(blob) > stitch_mod.STITCH_MAX_IMAGE_BYTES:
+            status, detail = stitch_mod.http_for_reason("payload_too_large")
+            raise HTTPException(status_code=status, detail=detail)
+        blobs.append(blob)
+    return blobs, subject
+
+
+@app.post("/capture/stitch")
+async def capture_stitch(
+    req: Request,
+    x_api_key: Annotated[str | None, Header()] = None,
+):
+    """Persist 2..N images and enqueue a vertical JPEG compose.
+
+    Composing runs in the ingest worker. This response does not stitch, and it
+    does not fetch remote image URLs. ``source_image_ids`` are UUID4s assigned
+    here, in multipart order, and reused if the worker retries.
+    """
+    verify_api_key(req, x_api_key)
+    blobs, subject = await _read_stitch_form(req)
+    try:
+        parts = stitch_mod.validate_stitch_parts(blobs)
+    except stitch_mod.StitchRejected as exc:
+        status, detail = stitch_mod.http_for_reason(exc.reason)
+        raise HTTPException(status_code=status, detail=detail) from exc
+    sources = stitch_mod.assign_source_images(parts)
+    image_name = f"{uuid.uuid4()}_stitch.jpg"
+    protected_url = f"/media/{image_name}"
+    try:
+        for part, source in zip(parts, sources, strict=True):
+            persist_uploaded_image(
+                part.data, source["image_name"], source["media_type"]
+            )
+        job = enqueue_ingest_job(
+            image_name,
+            "stitch.jpg",
+            "image/jpeg",
+            protected_url,
+            subject,
+            capture_kind="stitch",
+            source_image_ids=[source["id"] for source in sources],
+            source_images=sources,
+        )
+    except (PersistError, EnqueueError) as exc:
+        print(f"Error: stitch persist/enqueue failed: {exc}")
+        raise HTTPException(status_code=500, detail="Failed to persist stitch") from exc
     return JSONResponse(
         {
             "status": "accepted",
