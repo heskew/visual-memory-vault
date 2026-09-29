@@ -8,11 +8,15 @@ the vault.
 ## Architecture
 
 ```
-iPhone Shortcut ──upload──▶ Vault proxy ──▶ Vault agent (Gemini) ──▶ Flair (hub)
+iPhone Shortcut ──share──▶ Vault proxy ──▶ Vault agent (Gemini) ──▶ Flair (hub)
                                                                         ▲
 Claude / other MCP agents ──query via Flair's MCP hub────────────────────┘
 ```
 
+- Phone Share posts one image to `/upload`, two or more images to
+  `/capture/stitch`, or a page URL to `/capture/url`, then stops at `202`.
+  The recipe is [shortcuts/share-to-vault.md](shortcuts/share-to-vault.md).
+  Recall stays on Flair.
 - The vault (a Google ADK agent on GCP) extracts text from screenshots and
   writes memories into Flair, scoped to `app=visual-memory-vault`, `user=user`,
   under the `visual-memory-vault` agent identity.
