@@ -95,13 +95,15 @@ agents-cli deploy \
 
 ### Step 4: Verify Live End-to-End Recall
 
-1. Send an image upload from your phone via the Cloud Run proxy (send-and-forget; expect `202 Accepted` with `job_id` + `image_path`, not an agent writeup):
+1. Send an image upload from your phone via your proxy (send-and-forget; expect `202 Accepted` with `job_id` + `image_path`, not an agent writeup). Replace `https://YOUR_VAULT_PROXY` with that origin:
    ```bash
-   curl -X POST https://visual-memory-vault-proxy-151358874679.us-east1.run.app/upload \
+   curl -X POST https://YOUR_VAULT_PROXY/upload \
      -H "X-Api-Key: <YOUR_PROXY_KEY>" \
      -F "file=@receipt.jpg" \
      -F "subject=Test Onboarding"
    ```
+   From the phone, Share from Photos or Safari uses that same proxy and the same `X-Api-Key`. The shortcut recipe is [docs/shortcuts/share-to-vault.md](shortcuts/share-to-vault.md): one photo to `/upload`, two to eight photos to `/capture/stitch`, a Safari page to `/capture/url`. It expects this `202` and does not poll.
+
    Cloud Run is HTTP edge only and may scale to zero after `202`. The upload request does not run Gemini/Flair and does not rely on `create_task`. Persist the image, write a durable job (`vault-jobs/` when `GCS_BUCKET_NAME` is set), and enqueue Cloud Tasks to `POST /ingest` on the proxy you already deployed (`INGEST_HANDLER_URL`). That new request talks to Agent Engine. Poll `GET /jobs/{job_id}` for `pending` / `succeeded` / `failed`. Shortcut clients must not call `/ingest`. Local uvicorn may set `INGEST_DRAIN_INTERVAL_SEC` for a dev-only loop.
 
    To capture a public web page instead of a photo, `POST /capture/url` on that same proxy with JSON `{"url":"https://example.com","subject":"Example"}`. The response is the same `202` (`status`, `job_id`, `image_path`). The URL, subject, and `capture_kind=url` are stored on the durable job; the worker screenshots the page before extract and `store_memory`. The memory metadata includes `source_url`, `captured_at`, and `capture_kind=url`. When the page has them, it also includes `page_title`, `final_url` (after redirects), and `outbound_links` (at most 50 `{href, text}` pairs; targets are not fetched and page HTML is not stored). A missing title or an empty link list still succeeds. Poll `GET /jobs/{job_id}` the same way. A bad URL, an unsupported scheme, a blocked address, or a render timeout finishes as `failed`.

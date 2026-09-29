@@ -42,7 +42,7 @@ flowchart TD
         Web["Web UI (Chat + Photo Upload)"]
         URL["POST /capture/url"]
         Stitch["POST /capture/stitch"]
-        iOS["Mobile & iOS Shortcuts"]
+        iOS["Share from Photos or Safari"]
         Persist["Image + durable job (GCS / local)"]
         Tasks["Cloud Tasks → POST /ingest"]
         A2A["Peer Agents (A2A Protocol)"]
@@ -64,7 +64,7 @@ flowchart TD
     URL -->|202 then worker screenshot| Persist
     Stitch -->|202 then worker stacks JPEG| Persist
     Web -->|Chat| Agent
-    iOS -->|POST /upload 202| Persist
+    iOS -->|1 image /upload, 2+ /capture/stitch, page /capture/url| Persist
     Persist --> Tasks
     Tasks --> Agent
     A2A -->|JSON-RPC Stream| Agent
@@ -140,30 +140,78 @@ Open **`http://localhost:8080`** in your browser to start chatting and uploading
 
 ---
 
-## 📱 Mobile Ingestion (iOS Shortcuts / curl)
+## 📱 Mobile Ingestion (Share from Photos or Safari)
 
-Upload photos directly from your phone camera or automated workflow. This is **send-and-forget**: the proxy persists the image, enqueues a durable ingest job, and returns immediately. Do not wait on a summary or `RECEIPT` line — iOS Shortcuts typically time out around 30s if they do.
+Share from Photos or Safari is the phone path. One shortcut sends the share and stops when the proxy returns `202 Accepted`. It does not wait for Gemini, extract, or a `RECEIPT` line. A shortcut that waits on the write-up often hits the Shortcuts time limit; the job is already queued.
+
+The shortcut stores your proxy base URL and API key in two text fields on the phone. The base URL is a required Import Question with no default: the importer pastes their own origin (`https://YOUR_VAULT_PROXY`, https, host only). The shortcut checks that shape and does not pin a shared host.
+
+Auth is the same header production upload already uses: `X-Api-Key` set to that proxy's `PROXY_API_KEY`. The first time someone adds the shared shortcut, Shortcuts asks those two questions and saves the answers in that copy. Neither value is in the recipe. Actions and publishing steps: [docs/shortcuts/share-to-vault.md](docs/shortcuts/share-to-vault.md).
+
+Public iCloud link: *(not published yet)*. Publish from the Shortcuts app with **Copy iCloud Link**. The publishing Apple ID signs it. The Apple Developer Program is not required. Importers review the actions before adding. Replace this sentence with the link after it exists.
+
+| What you share | Request | Body |
+| --- | --- | --- |
+| 1 image | `POST /upload` | multipart field `file` |
+| 2 to 8 images | `POST /capture/stitch` | multipart field `file`, repeated, in share order |
+| A URL or Safari page | `POST /capture/url` | JSON `{"url":"…"}`. `subject` is optional |
+
+If the share has both images and a URL, the images win (one image uploads, two or more stitch). Safari's share button sends the page URL alone.
+
+Each call returns `202` with `status`, `job_id`, and `image_path`. The shortcut shows **Queued** and the `job_id`. A `4xx`, or any body that is not `status` `accepted` with a `job_id`, shows **Not queued** and the proxy's `detail` when the body includes one. More than 8 images stops in the shortcut before the request. Stitch still applies its own type and size limits. The shortcut does not call `POST /ingest` and does not poll.
+
+### curl (Mac or a terminal)
+
+Same three calls. `https://YOUR_VAULT_PROXY` stands in for your proxy origin. Replace `<YOUR_PROXY_KEY>`. Keep the key in the header, not the URL.
 
 ```bash
-curl -X POST http://localhost:8080/upload \
+curl -X POST https://YOUR_VAULT_PROXY/upload \
+  -H "X-Api-Key: <YOUR_PROXY_KEY>" \
   -F "file=@receipt.jpg" \
   -F "subject=Dinner Receipt"
 ```
 
+```bash
+curl -X POST https://YOUR_VAULT_PROXY/capture/stitch \
+  -H "X-Api-Key: <YOUR_PROXY_KEY>" \
+  -F "file=@one.jpg" \
+  -F "file=@two.png" \
+  -F "subject=Trip"
+```
+
+```bash
+curl -X POST https://YOUR_VAULT_PROXY/capture/url \
+  -H "X-Api-Key: <YOUR_PROXY_KEY>" \
+  -H "Content-Type: application/json" \
+  -d '{"url":"https://example.com","subject":"Example"}'
+```
+
 Response (`202 Accepted`):
+
 ```json
 {
   "status": "accepted",
   "job_id": "<uuid>",
-  "image_path": "/media/<uuid>_receipt.jpg"
+  "image_path": "/media/<uuid>_…"
 }
 ```
 
-The in-app web UI uses the same `POST /upload`, then polls `GET /jobs/{job_id}` until extract + `store_memory` finishes and the receipt chip can render. Production ingest is a **new HTTP request** created by Cloud Tasks (`POST /ingest`), not CPU leftover on the upload instance. Local uvicorn can drain jobs when `INGEST_DRAIN_INTERVAL_SEC` is set.
+Optional status check, not part of the share:
+
+```bash
+curl "https://YOUR_VAULT_PROXY/jobs/<job_id>" \
+  -H "X-Api-Key: <YOUR_PROXY_KEY>"
+```
+
+`status` is `pending`, `succeeded`, or `failed`.
+
+On a local proxy (`http://localhost:8080`) the paths and bodies are the same. Send `X-Api-Key` when `PROXY_API_KEY` is set. `ALLOW_UNAUTHENTICATED=1` is local open access only.
+
+The in-app web UI uses the same `POST /upload`, then polls `GET /jobs/{job_id}` until extract + `store_memory` finishes and the receipt chip can render. Production ingest is a **new HTTP request** created by Cloud Tasks (`POST /ingest`), not CPU leftover on the upload instance. Local uvicorn can drain jobs when `INGEST_DRAIN_INTERVAL_SEC` is set. Phone Share does not poll and must not call `/ingest`.
 
 ### Capture a public page
 
-`POST /capture/url` takes a public `http` or `https` URL, reserves an image path, and returns the same `202` as an upload. The worker screenshots the page (viewport JPEG), saves it like an uploaded photo, then runs the existing extract and `store_memory` path. Poll `GET /jobs/{job_id}`. There is no `?wait=1`.
+`POST /capture/url` takes a public `http` or `https` URL, reserves an image path, and returns the same `202` as an upload. The worker screenshots the page (viewport JPEG), saves it like an uploaded photo, then runs the existing extract and `store_memory` path. Poll `GET /jobs/{job_id}`. There is no `?wait=1`. The phone sends this from Safari; the proxy base URL and `X-Api-Key` header are in Mobile Ingestion above.
 
 ```bash
 curl -X POST http://localhost:8080/capture/url \
@@ -187,7 +235,7 @@ Only public HTTP(S) URLs are captured. Other schemes, unresolvable hosts, and ad
 
 ### Stitch screenshots into one memory
 
-`POST /capture/stitch` accepts two or more screenshots and returns the same `202` as an upload (`status`, `job_id`, `image_path`). The worker stacks those images, top to bottom in the order they were sent, into one JPEG, saves it like an uploaded photo, then runs extract and `store_memory`. Poll `GET /jobs/{job_id}`. There is no `?wait=1`. Remote image URLs are not fetched.
+`POST /capture/stitch` accepts two or more screenshots and returns the same `202` as an upload (`status`, `job_id`, `image_path`). The worker stacks those images, top to bottom in the order they were sent, into one JPEG, saves it like an uploaded photo, then runs extract and `store_memory`. Poll `GET /jobs/{job_id}`. There is no `?wait=1`. Remote image URLs are not fetched. The phone sends this when a share has 2 to 8 images; the proxy base URL and `X-Api-Key` header are in Mobile Ingestion above.
 
 ```bash
 curl -X POST http://localhost:8080/capture/stitch \
